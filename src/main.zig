@@ -117,8 +117,6 @@ const QueryParser = struct {
 
 const SymbolDoc = struct {
     query: []const u8,
-    parent_symbol: []const u8,
-    member_name: []const u8,
     decl_index: Walk.Decl.Index,
     target_index: Walk.Decl.Index,
     category: Walk.Category,
@@ -170,7 +168,7 @@ pub fn main(init: std.process.Init) !void {
         try processBuildZig(&arena, io);
     }
 
-    try printDocs(arena.allocator(), options.symbols.items, std_dir_path);
+    try printDocs(arena.allocator(), options.symbols.items);
 }
 
 fn parseCli(allocator: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !CliOptions {
@@ -584,7 +582,7 @@ fn resolveHierarchical(allocator: std.mem.Allocator, symbol: []const u8) !?Walk.
     return current_decl;
 }
 
-fn printDocs(allocator: std.mem.Allocator, symbols: []const []const u8, std_dir_path: []const u8) !void {
+fn printDocs(allocator: std.mem.Allocator, symbols: []const []const u8) !void {
     var threaded: std.Io.Threaded = .init_single_threaded;
     const io = threaded.io();
     var stdout_buf: [4096]u8 = undefined;
@@ -603,11 +601,7 @@ fn printDocs(allocator: std.mem.Allocator, symbols: []const []const u8, std_dir_
         try docs.append(allocator, try buildSymbolDoc(allocator, symbol, decl_index));
     }
 
-    if (docs.items.len == 1) {
-        try renderSingleDoc(allocator, stdout, docs.items[0], std_dir_path);
-    } else {
-        try renderGroupedDocs(allocator, stdout, docs.items, std_dir_path);
-    }
+    try renderDocs(allocator, stdout, docs.items);
 
     try stdout.flush();
 }
@@ -642,8 +636,6 @@ fn buildSymbolDoc(allocator: std.mem.Allocator, symbol: []const u8, decl_index: 
     const target_decl = target_index.get();
     return .{
         .query = symbol,
-        .parent_symbol = try parentSymbol(allocator, symbol),
-        .member_name = memberName(symbol),
         .decl_index = decl_index,
         .target_index = target_index,
         .category = category,
@@ -666,16 +658,6 @@ fn resolveAliasTarget(decl_index: Walk.Decl.Index) !struct { Walk.Decl.Index, Wa
     return .{ target_index, category };
 }
 
-fn parentSymbol(allocator: std.mem.Allocator, symbol: []const u8) ![]const u8 {
-    const dot = std.mem.lastIndexOfScalar(u8, symbol, '.') orelse return allocator.dupe(u8, symbol);
-    return allocator.dupe(u8, symbol[0..dot]);
-}
-
-fn memberName(symbol: []const u8) []const u8 {
-    const dot = std.mem.lastIndexOfScalar(u8, symbol, '.') orelse return symbol;
-    return symbol[dot + 1 ..];
-}
-
 fn declLine(decl: *const Walk.Decl) usize {
     const ast = decl.file.getAst();
     const token_starts = ast.tokens.items(.start);
@@ -685,13 +667,16 @@ fn declLine(decl: *const Walk.Decl) usize {
     return loc.line + 1;
 }
 
-fn renderSingleDoc(
-    allocator: std.mem.Allocator,
-    writer: anytype,
-    doc: SymbolDoc,
-    std_dir_path: []const u8,
-) !void {
-    _ = std_dir_path;
+fn renderDocs(allocator: std.mem.Allocator, writer: anytype, docs: []const SymbolDoc) !void {
+    for (docs, 0..) |doc, i| {
+        if (i > 0) try writer.writeByte('\n');
+        try renderDocItem(allocator, writer, doc);
+    }
+
+    try writer.writeAll("\nhint: use cx with the shown file and line to inspect source\n");
+}
+
+fn renderDocItem(allocator: std.mem.Allocator, writer: anytype, doc: SymbolDoc) !void {
     try writer.print("{s} at {s}:{d}\n", .{ doc.query, doc.file_path, doc.line });
     try renderDocBlock(writer, doc, 2);
 
@@ -704,37 +689,9 @@ fn renderSingleDoc(
 
     const has_members = try printMembers(allocator, writer, doc.target_index.get(), doc.category);
     if (doc.category == .type_function and !has_members) {
-        try writer.writeAll("\nSource:\n");
+        try writer.writeAll("\nsource:\n");
         try printSource(writer, doc.target_index.get().file.getAst(), doc.target_index.get().ast_node);
     }
-
-    try writer.writeAll("\nhint: use cx with the shown file and line to inspect source\n");
-}
-
-fn renderGroupedDocs(
-    allocator: std.mem.Allocator,
-    writer: anytype,
-    docs: []const SymbolDoc,
-    std_dir_path: []const u8,
-) !void {
-    _ = std_dir_path;
-
-    var first_group = true;
-    for (docs) |doc| {
-        if (hasEarlierParent(docs, doc.parent_symbol, doc.query)) continue;
-        if (!first_group) try writer.writeAll("\n");
-        first_group = false;
-
-        try renderGroupHeader(allocator, writer, doc.parent_symbol);
-        for (docs) |member_doc| {
-            if (!std.mem.eql(u8, member_doc.parent_symbol, doc.parent_symbol)) continue;
-            try writer.writeByte('\n');
-            try writer.print("{s} (ln:{d}):\n", .{ member_doc.member_name, member_doc.line });
-            try renderDocBlock(writer, member_doc, 2);
-        }
-    }
-
-    try writer.writeAll("\nhint: use cx with the shown file and line to inspect source\n");
 }
 
 fn renderDocBlock(writer: anytype, doc: SymbolDoc, indent: usize) !void {
@@ -754,24 +711,6 @@ fn renderDocBlock(writer: anytype, doc: SymbolDoc, indent: usize) !void {
         try writer.writeAll("docs:\n");
         try renderIndentedDocComments(writer, doc, indent + 2);
     }
-}
-
-fn renderGroupHeader(allocator: std.mem.Allocator, writer: anytype, parent_symbol: []const u8) !void {
-    if (try findSymbol(allocator, parent_symbol)) |parent_index| {
-        const target_index, _ = try resolveAliasTarget(parent_index);
-        const target = target_index.get();
-        try writer.print("{s} at {s}:{d}\n", .{ parent_symbol, target.file.path(), declLine(target) });
-    } else {
-        try writer.print("{s}\n", .{parent_symbol});
-    }
-}
-
-fn hasEarlierParent(docs: []const SymbolDoc, parent: []const u8, query: []const u8) bool {
-    for (docs) |doc| {
-        if (std.mem.eql(u8, doc.query, query)) return false;
-        if (std.mem.eql(u8, doc.parent_symbol, parent)) return true;
-    }
-    return false;
 }
 
 fn printNotFound(allocator: std.mem.Allocator, writer: anytype, symbol: []const u8) !void {
@@ -815,17 +754,19 @@ fn printNotFound(allocator: std.mem.Allocator, writer: anytype, symbol: []const 
 fn printMembers(allocator: std.mem.Allocator, writer: anytype, decl: *const Walk.Decl, category: Walk.Category) !bool {
     switch (category) {
         .type_function, .namespace, .container => {
-            var functions: std.ArrayList([]const u8) = .empty;
+            var functions: std.ArrayList(Walk.Decl.Index) = .empty;
             defer functions.deinit(allocator);
-            var type_functions: std.ArrayList([]const u8) = .empty;
+            var type_functions: std.ArrayList(Walk.Decl.Index) = .empty;
             defer type_functions.deinit(allocator);
-            var constants: std.ArrayList([]const u8) = .empty;
+            var constants: std.ArrayList(Walk.Decl.Index) = .empty;
             defer constants.deinit(allocator);
-            var types: std.ArrayList([]const u8) = .empty;
+            var types: std.ArrayList(Walk.Decl.Index) = .empty;
             defer types.deinit(allocator);
+
             const FieldInfo = struct {
                 name: []const u8,
                 type_str: []const u8,
+                line: usize,
                 doc_comment: ?std.zig.Ast.TokenIndex,
             };
             var fields: std.ArrayList(FieldInfo) = .empty;
@@ -864,6 +805,7 @@ fn printMembers(allocator: std.mem.Allocator, writer: anytype, decl: *const Walk
                                 try fields.append(allocator, .{
                                     .name = field_name,
                                     .type_str = type_str,
+                                    .line = lineForToken(ast, field.firstToken()),
                                     .doc_comment = first_doc.unwrap(),
                                 });
                             }
@@ -885,11 +827,8 @@ fn printMembers(allocator: std.mem.Allocator, writer: anytype, decl: *const Walk
                 @panic("decl not found in Walk.decls.items");
             };
 
-            var checked: usize = 0;
-            var matched_parent: usize = 0;
             while (i < Walk.decls.items.len) : (i += 1) {
                 const candidate = &Walk.decls.items[i];
-                checked += 1;
                 // Validate parent index before using it
                 if (candidate.parent != .none) {
                     const pidx = @intFromEnum(candidate.parent);
@@ -900,7 +839,6 @@ fn printMembers(allocator: std.mem.Allocator, writer: anytype, decl: *const Walk
                     if (pidx != target_decl_idx) {
                         continue;
                     }
-                    matched_parent += 1;
                 } else {
                     continue; // No parent
                 }
@@ -910,17 +848,18 @@ fn printMembers(allocator: std.mem.Allocator, writer: anytype, decl: *const Walk
                 if (member_info.name.len == 0) continue;
 
                 const member_cat = candidate.categorize();
+                const member_index: Walk.Decl.Index = @enumFromInt(i);
                 switch (member_cat) {
-                    .function => try functions.append(allocator, member_info.name),
-                    .type_function => try type_functions.append(allocator, member_info.name),
-                    .namespace, .container => try types.append(allocator, member_info.name),
+                    .function => try functions.append(allocator, member_index),
+                    .type_function => try type_functions.append(allocator, member_index),
+                    .namespace, .container => try types.append(allocator, member_index),
                     .alias => |alias_index| {
                         // Follow alias chain to get the final category
                         // Guard against invalid alias indices
                         const idx = @intFromEnum(alias_index);
                         if (alias_index == .none or idx >= Walk.decls.items.len) {
                             // Invalid alias, treat as constant
-                            try constants.append(allocator, member_info.name);
+                            try constants.append(allocator, member_index);
                             continue;
                         }
 
@@ -935,13 +874,13 @@ fn printMembers(allocator: std.mem.Allocator, writer: anytype, decl: *const Walk
                             resolved_cat = resolved_index.get().categorize();
                         }
                         switch (resolved_cat) {
-                            .namespace, .container => try types.append(allocator, member_info.name),
-                            .function => try functions.append(allocator, member_info.name),
-                            .type_function => try type_functions.append(allocator, member_info.name),
-                            else => try constants.append(allocator, member_info.name),
+                            .namespace, .container => try types.append(allocator, member_index),
+                            .function => try functions.append(allocator, member_index),
+                            .type_function => try type_functions.append(allocator, member_index),
+                            else => try constants.append(allocator, member_index),
                         }
                     },
-                    .global_const => try constants.append(allocator, member_info.name),
+                    .global_const, .global_variable => try constants.append(allocator, member_index),
                     else => {},
                 }
             }
@@ -949,62 +888,26 @@ fn printMembers(allocator: std.mem.Allocator, writer: anytype, decl: *const Walk
             var has_members = false;
 
             if (fields.items.len > 0) {
-                try writer.writeAll("\nFields:\n");
-                var prev_had_doc = false;
+                try writer.writeAll("\nfields:\n");
                 for (fields.items) |field| {
-                    if (prev_had_doc) try writer.writeAll("\n");
+                    try writer.print("  {s} (ln:{d}):\n", .{ field.name, field.line });
                     if (field.type_str.len > 0) {
-                        try writer.print("  {s}: {s}\n", .{ field.name, field.type_str });
-                    } else {
-                        try writer.print("  {s}\n", .{field.name});
+                        try writer.print("    type: {s}\n", .{field.type_str});
                     }
                     if (field.doc_comment) |first_doc| {
-                        var token_idx = first_doc;
-                        var has_any_docs = false;
-                        while (ast.tokenTag(token_idx) == .doc_comment) : (token_idx += 1) {
-                            const comment = ast.tokenSlice(token_idx);
-                            try writer.print("      {s}\n", .{comment[3..]});
-                            has_any_docs = true;
+                        if (ast.tokenTag(first_doc) == .doc_comment) {
+                            try writer.writeAll("    docs:\n");
+                            try writeDocLines(writer, ast, first_doc, .doc_comment, 6);
                         }
-                        prev_had_doc = has_any_docs;
-                    } else {
-                        prev_had_doc = false;
                     }
                 }
                 has_members = true;
             }
 
-            if (type_functions.items.len > 0) {
-                try writer.writeAll("\nType Functions:\n");
-                for (type_functions.items) |name| {
-                    try writer.print("  {s}\n", .{name});
-                }
-                has_members = true;
-            }
-
-            if (types.items.len > 0) {
-                try writer.writeAll("\nTypes:\n");
-                for (types.items) |name| {
-                    try writer.print("  {s}\n", .{name});
-                }
-                has_members = true;
-            }
-
-            if (functions.items.len > 0) {
-                try writer.writeAll("\nFunctions:\n");
-                for (functions.items) |name| {
-                    try writer.print("  {s}\n", .{name});
-                }
-                has_members = true;
-            }
-
-            if (constants.items.len > 0) {
-                try writer.writeAll("\nConstants:\n");
-                for (constants.items) |name| {
-                    try writer.print("  {s}\n", .{name});
-                }
-                has_members = true;
-            }
+            has_members = try renderMemberSection(allocator, writer, "type_functions", type_functions.items) or has_members;
+            has_members = try renderMemberSection(allocator, writer, "types", types.items) or has_members;
+            has_members = try renderMemberSection(allocator, writer, "functions", functions.items) or has_members;
+            has_members = try renderMemberSection(allocator, writer, "constants", constants.items) or has_members;
 
             if (has_members) {
                 try writer.writeAll("\n");
@@ -1016,20 +919,45 @@ fn printMembers(allocator: std.mem.Allocator, writer: anytype, decl: *const Walk
     }
 }
 
-fn getFullPath(allocator: std.mem.Allocator, std_dir_path: []const u8, file_path: []const u8) ![]const u8 {
-    // If already an absolute path, return as-is
-    if (std.fs.path.isAbsolute(file_path)) {
-        return allocator.dupe(u8, file_path);
+fn renderMemberSection(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    section_name: []const u8,
+    members: []const Walk.Decl.Index,
+) !bool {
+    if (members.len == 0) return false;
+
+    try writer.print("\n{s}:\n", .{section_name});
+    for (members) |member_index| {
+        try renderMemberDoc(allocator, writer, member_index);
     }
 
-    // For "std/..." paths, prepend std_dir_path
-    if (std.mem.startsWith(u8, file_path, "std/")) {
-        const relative_path = file_path[4..]; // Remove "std/" prefix
-        return std.fmt.allocPrint(allocator, "{s}/{s}", .{ std_dir_path, relative_path });
-    }
+    return true;
+}
 
-    // Fallback for any other path
-    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ std_dir_path, file_path });
+fn renderMemberDoc(allocator: std.mem.Allocator, writer: anytype, decl_index: Walk.Decl.Index) !void {
+    const decl = decl_index.get();
+    const info = decl.extraInfo();
+    const target_index, const category = try resolveAliasTarget(decl_index);
+    const target_decl = target_index.get();
+    const member_doc: SymbolDoc = .{
+        .query = info.name,
+        .decl_index = decl_index,
+        .target_index = target_index,
+        .category = category,
+        .file_path = target_decl.file.path(),
+        .line = declLine(target_decl),
+        .signature = try formatSignature(allocator, target_decl.file.getAst(), target_decl, category),
+    };
+
+    try writer.print("  {s} (ln:{d}):\n", .{ info.name, member_doc.line });
+    try renderDocBlock(writer, member_doc, 4);
+}
+
+fn lineForToken(ast: *const std.zig.Ast, token: std.zig.Ast.TokenIndex) usize {
+    const token_starts = ast.tokens.items(.start);
+    const loc = std.zig.findLineColumn(ast.source, token_starts[token]);
+    return loc.line + 1;
 }
 
 fn formatSignature(
@@ -1042,19 +970,6 @@ fn formatSignature(
     errdefer writer.deinit();
     try writeSignatureValue(allocator, &writer.writer, ast, decl, category);
     return try writer.toOwnedSlice();
-}
-
-fn printSignature(writer: anytype, ast: *const std.zig.Ast, decl: *const Walk.Decl, category: Walk.Category) !void {
-    var allocating: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
-    defer allocating.deinit();
-    try writeSignatureValue(std.heap.page_allocator, &allocating.writer, ast, decl, category);
-    const signature = allocating.written();
-    switch (category) {
-        .function, .type_function => try writer.print("Signature: {s}\n", .{signature}),
-        .global_const, .global_variable => try writer.print("Declaration: {s}\n", .{signature}),
-        .container, .namespace => try writer.print("Type: {s}\n", .{signature}),
-        else => {},
-    }
 }
 
 fn writeSignatureValue(
@@ -1075,7 +990,7 @@ fn writeSignatureValue(
             else
                 findClosingParen(ast, fn_proto.lparen);
             const source = sourceForTokenRange(ast, start_token, end_token);
-            try writeCollapsedWhitespace(allocator, writer, source);
+            try writeCleanedSignature(allocator, writer, source);
         },
         .global_const, .global_variable => |node| {
             const var_decl = ast.fullVarDecl(node) orelse return;
@@ -1148,6 +1063,65 @@ fn writeCollapsedWhitespace(allocator: std.mem.Allocator, writer: anytype, sourc
     }
 }
 
+fn writeCleanedSignature(allocator: std.mem.Allocator, writer: anytype, source: []const u8) !void {
+    var joined: std.ArrayList(u8) = .empty;
+    defer joined.deinit(allocator);
+
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, &std.ascii.whitespace);
+        if (trimmed.len == 0) continue;
+        if (std.mem.startsWith(u8, trimmed, "///")) continue;
+
+        if (joined.items.len > 0) try joined.append(allocator, ' ');
+        try joined.appendSlice(allocator, trimmed);
+    }
+
+    var normalized: std.ArrayList(u8) = .empty;
+    defer normalized.deinit(allocator);
+
+    var pending_space = false;
+    for (joined.items) |byte| {
+        if (std.ascii.isWhitespace(byte)) {
+            pending_space = true;
+            continue;
+        }
+
+        if (byte == ')' and
+            normalized.items.len > 0 and
+            normalized.items[normalized.items.len - 1] == ',')
+        {
+            normalized.items.len -= 1;
+        }
+
+        if (pending_space and normalized.items.len > 0) {
+            const previous = normalized.items[normalized.items.len - 1];
+            if (!suppressesSpaceAfter(previous) and !suppressesSpaceBefore(byte)) {
+                try normalized.append(allocator, ' ');
+            }
+        }
+
+        try normalized.append(allocator, byte);
+        pending_space = false;
+    }
+
+    try writer.writeAll(normalized.items);
+}
+
+fn suppressesSpaceAfter(byte: u8) bool {
+    return switch (byte) {
+        '(', '[', '.', '!' => true,
+        else => false,
+    };
+}
+
+fn suppressesSpaceBefore(byte: u8) bool {
+    return switch (byte) {
+        ')', ']', ',', '.', '!', ':' => true,
+        else => false,
+    };
+}
+
 fn hasDocComment(doc: SymbolDoc) bool {
     const decl = doc.decl_index.get();
     const target_decl = doc.target_index.get();
@@ -1163,12 +1137,6 @@ fn hasDocComment(doc: SymbolDoc) bool {
 fn hasDocToken(ast: *const std.zig.Ast, maybe_token: ?std.zig.Ast.TokenIndex, tag: std.zig.Token.Tag) bool {
     const token = maybe_token orelse return false;
     return ast.tokenTag(token) == tag;
-}
-
-fn renderDocComments(writer: anytype, doc: SymbolDoc) !void {
-    if (!hasDocComment(doc)) return;
-    try writer.writeAll("\ndoc:\n");
-    try renderIndentedDocComments(writer, doc, 2);
 }
 
 fn renderIndentedDocComments(writer: anytype, doc: SymbolDoc, indent: usize) !void {
@@ -1212,22 +1180,6 @@ fn writeIndent(writer: anytype, indent: usize) !void {
     while (i < indent) : (i += 1) try writer.writeByte(' ');
 }
 
-fn printDocComments(writer: anytype, ast: *const std.zig.Ast, first_token: std.zig.Ast.TokenIndex) !void {
-    var token_index = first_token;
-    while (ast.tokenTag(token_index) == .doc_comment) : (token_index += 1) {
-        const comment = ast.tokenSlice(token_index);
-        try writer.print(" {s}\n", .{comment[3..]});
-    }
-}
-
-fn printContainerDocComments(writer: anytype, ast: *const std.zig.Ast, first_token: std.zig.Ast.TokenIndex) !void {
-    var token_index = first_token;
-    while (ast.tokenTag(token_index) == .container_doc_comment) : (token_index += 1) {
-        const comment = ast.tokenSlice(token_index);
-        try writer.print(" {s}\n", .{comment[3..]});
-    }
-}
-
 fn printSource(writer: anytype, ast: *const std.zig.Ast, node: std.zig.Ast.Node.Index) !void {
     const token_starts = ast.tokens.items(.start);
     const start_token = ast.firstToken(node);
@@ -1246,6 +1198,25 @@ fn printSource(writer: anytype, ast: *const std.zig.Ast, node: std.zig.Ast.Node.
     while (lines.next()) |line| {
         try writer.print("  {s}\n", .{line});
     }
+}
+
+test "signature cleaner strips docs and preserves Zig punctuation" {
+    var writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer writer.deinit();
+
+    try writeCleanedSignature(std.testing.allocator, &writer.writer,
+        \\(
+        \\    /// doc comment inside a multi-line function signature
+        \\    self: Allocator,
+        \\    comptime optional_alignment: ?Alignment,
+        \\    comptime sentinel: Elem,
+        \\) Error![:sentinel]Elem
+    );
+
+    try std.testing.expectEqualStrings(
+        "(self: Allocator, comptime optional_alignment: ?Alignment, comptime sentinel: Elem) Error![:sentinel]Elem",
+        writer.written(),
+    );
 }
 
 test "query parser expands nested member groups" {

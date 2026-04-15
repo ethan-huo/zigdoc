@@ -55,15 +55,14 @@ std.multi_array_list.MultiArrayList.Slice.get
 std.multi_array_list.MultiArrayList.Slice.set
 ```
 
-Output groups by direct parent:
+Each expanded symbol renders as the same result block used by single-symbol
+queries:
 
 ```text
-std.multi_array_list.MultiArrayList.Slice at std/multi_array_list.zig:87
-
-get (ln:124):
+std.multi_array_list.MultiArrayList.Slice.get at std/multi_array_list.zig:124
   sig: (self: Slice, index: usize) T
 
-set (ln:113):
+std.multi_array_list.MultiArrayList.Slice.set at std/multi_array_list.zig:113
   sig: (self: *Slice, index: usize, elem: T) void
 ```
 
@@ -76,6 +75,15 @@ zigdoc std.multi_array_list.MultiArrayList.Slice
 ```
 
 Use type/container queries to discover available fields, functions, nested types, and constants before guessing member names.
+Function members include line, signature, and doc comments when present:
+
+```text
+functions:
+  alloc (ln:197):
+    sig: (self: Allocator, comptime T: type, n: usize) Error![]T
+    docs:
+      ...
+```
 
 ## Combining With cx
 

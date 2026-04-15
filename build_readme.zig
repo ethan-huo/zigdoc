@@ -62,8 +62,9 @@ pub fn main(init: std.process.Init) !void {
         \\
         \\- View documentation for any public symbol in the Zig standard library
         \\- Access documentation for imported modules from your build.zig
+        \\- Query multiple related symbols with grouped syntax like `std.Type.(a, b, Nested.(c, d))`
         \\- Shows symbol location, category, and signature
-        \\- Displays doc comments and members
+        \\- Displays doc comments, members, and member signatures/docs for type queries
         \\- Follows aliases to implementation
         \\
     , .{help_content});

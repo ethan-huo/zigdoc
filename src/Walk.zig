@@ -351,9 +351,6 @@ pub const File = struct {
                     }
                 }
 
-                log.debug("from '{s}' @import '{s}' resolved='{s}'", .{
-                    file_index.path(), file_path, resolved_path,
-                });
                 if (files.getIndex(resolved_path)) |imported_file_index| {
                     return Category.makeAlias(
                         File.Index.findRootDecl(@enumFromInt(imported_file_index)),
