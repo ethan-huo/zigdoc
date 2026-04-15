@@ -1,0 +1,4 @@
+interface:
+  display_name: "Zigdoc"
+  short_description: "Query Zig docs and source clues"
+  default_prompt: "Use $zigdoc to look up current Zig API docs and source clues."
