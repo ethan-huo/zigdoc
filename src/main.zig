@@ -695,10 +695,8 @@ fn renderSingleDoc(
     std_dir_path: []const u8,
 ) !void {
     _ = std_dir_path;
-    try writer.print("{s}\n", .{doc.query});
-    if (doc.signature.len > 0) try writer.print("  signature: {s}\n", .{doc.signature});
-    try writer.print("  at {s}:{d}\n", .{ doc.file_path, doc.line });
-    try writer.print("  category: {s}\n", .{@tagName(doc.category)});
+    try writer.print("{s} at {s}:{d}\n", .{ doc.query, doc.file_path, doc.line });
+    try renderDocBlock(writer, doc, 2);
 
     if (doc.target_index != doc.decl_index) {
         var target_fqn: std.ArrayList(u8) = .empty;
@@ -707,7 +705,6 @@ fn renderSingleDoc(
         try writer.print("  alias target: {s}\n", .{target_fqn.items});
     }
 
-    try renderDocComments(writer, doc);
     const has_members = try printMembers(allocator, writer, doc.target_index.get(), doc.category);
     if (doc.category == .type_function and !has_members) {
         try writer.writeAll("\nSource:\n");
@@ -732,31 +729,34 @@ fn renderGroupedDocs(
         first_group = false;
 
         try renderGroupHeader(allocator, writer, doc.parent_symbol);
-        const count = countParent(docs, doc.parent_symbol);
-        try writer.print("[{d}]{{member,signature,line}}:\n", .{count});
         for (docs) |member_doc| {
             if (!std.mem.eql(u8, member_doc.parent_symbol, doc.parent_symbol)) continue;
-            try writer.print("  .{s}  {s}  {d}\n", .{
-                member_doc.member_name,
-                member_doc.signature,
-                member_doc.line,
-            });
-        }
-
-        var wrote_docs = false;
-        for (docs) |member_doc| {
-            if (!std.mem.eql(u8, member_doc.parent_symbol, doc.parent_symbol)) continue;
-            if (!hasDocComment(member_doc)) continue;
-            if (!wrote_docs) {
-                try writer.writeAll("\ndocs:\n");
-                wrote_docs = true;
-            }
-            try writer.print("  .{s}:\n", .{member_doc.member_name});
-            try renderIndentedDocComments(writer, member_doc, 4);
+            try writer.writeByte('\n');
+            try writer.print("{s} (ln:{d}):\n", .{ member_doc.member_name, member_doc.line });
+            try renderDocBlock(writer, member_doc, 2);
         }
     }
 
     try writer.writeAll("\nhint: use cx with the shown file and line to inspect source\n");
+}
+
+fn renderDocBlock(writer: anytype, doc: SymbolDoc, indent: usize) !void {
+    if (doc.signature.len > 0) {
+        try writeIndent(writer, indent);
+        const label = switch (doc.category) {
+            .function, .type_function => "sig",
+            .global_const, .global_variable => "decl",
+            .container, .namespace => "type",
+            else => "info",
+        };
+        try writer.print("{s}: {s}\n", .{ label, doc.signature });
+    }
+
+    if (hasDocComment(doc)) {
+        try writeIndent(writer, indent);
+        try writer.writeAll("docs:\n");
+        try renderIndentedDocComments(writer, doc, indent + 2);
+    }
 }
 
 fn renderGroupHeader(allocator: std.mem.Allocator, writer: anytype, parent_symbol: []const u8) !void {
@@ -775,14 +775,6 @@ fn hasEarlierParent(docs: []const SymbolDoc, parent: []const u8, query: []const 
         if (std.mem.eql(u8, doc.parent_symbol, parent)) return true;
     }
     return false;
-}
-
-fn countParent(docs: []const SymbolDoc, parent: []const u8) usize {
-    var count: usize = 0;
-    for (docs) |doc| {
-        if (std.mem.eql(u8, doc.parent_symbol, parent)) count += 1;
-    }
-    return count;
 }
 
 fn printNotFound(allocator: std.mem.Allocator, writer: anytype, symbol: []const u8) !void {
@@ -1080,7 +1072,7 @@ fn writeSignatureValue(
             var buf: [1]std.zig.Ast.Node.Index = undefined;
             const fn_proto = ast.fullFnProto(&buf, node) orelse return;
 
-            const start_token = fn_proto.firstToken();
+            const start_token = fn_proto.lparen;
             const end_token = if (fn_proto.ast.return_type.unwrap()) |return_type|
                 ast.lastToken(return_type)
             else
