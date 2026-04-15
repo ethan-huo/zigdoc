@@ -38,8 +38,8 @@ pub fn main(init: std.process.Init) !void {
         \\
         \\## Project Initialization
         \\
-        \\`zigdoc @init` scaffolds a minimal Zig project with `AGENTS.md`,
-        \\installs the Zig skill to `.agents/skills/zig`, and creates `build.zig`
+        \\`zigdoc init` scaffolds a minimal Zig project with `AGENTS.md`,
+        \\installs skills to `.agents/skills`, and creates `build.zig`
         \\plus `build.zig.zon`.
         \\
         \\Skill installation downloads the latest zigdoc repository archive, so
@@ -47,7 +47,16 @@ pub fn main(init: std.process.Init) !void {
         \\
         \\```bash
         \\mkdir my-project && cd my-project
-        \\zigdoc @init
+        \\zigdoc init
+        \\```
+        \\
+        \\## Skill Installation
+        \\
+        \\`zigdoc skill install` installs the repository skills into `.agents/skills`
+        \\without creating or changing `build.zig`, `build.zig.zon`, or source files.
+        \\
+        \\```bash
+        \\zigdoc skill install
         \\```
         \\
         \\## Examples

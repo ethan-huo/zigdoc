@@ -31,13 +31,14 @@ Options:
   --dump-imports    Dump module imports from build.zig as JSON
 
 Commands:
-  @init             Initialize a new Zig project with AGENTS.md and the Zig skill
+  init              Initialize a new Zig project with AGENTS.md and skills
+  skill install     Install skills into .agents/skills
 ```
 
 ## Project Initialization
 
-`zigdoc @init` scaffolds a minimal Zig project with `AGENTS.md`,
-installs the Zig skill to `.agents/skills/zig`, and creates `build.zig`
+`zigdoc init` scaffolds a minimal Zig project with `AGENTS.md`,
+installs skills to `.agents/skills`, and creates `build.zig`
 plus `build.zig.zon`.
 
 Skill installation downloads the latest zigdoc repository archive, so
@@ -45,7 +46,16 @@ Skill installation downloads the latest zigdoc repository archive, so
 
 ```bash
 mkdir my-project && cd my-project
-zigdoc @init
+zigdoc init
+```
+
+## Skill Installation
+
+`zigdoc skill install` installs the repository skills into `.agents/skills`
+without creating or changing `build.zig`, `build.zig.zon`, or source files.
+
+```bash
+zigdoc skill install
 ```
 
 ## Examples

@@ -11,13 +11,13 @@ const template_build_zig_zon = @embedFile("templates/build.zig.zon.template");
 const template_agents_md = @embedFile("templates/AGENTS.md.template");
 const template_gitignore = @embedFile("templates/.gitignore.template");
 
-const zig_skill_archive_url = "https://github.com/ethan-huo/zigdoc/archive/refs/heads/main.zip";
-const zig_skill_archive_root = "zigdoc-main";
-const zig_skill_temp_root = ".zig-cache/zigdoc-init";
-const zig_skill_zip_path = zig_skill_temp_root ++ "/zigdoc.zip";
-const zig_skill_extract_path = zig_skill_temp_root ++ "/extract";
-const zig_skill_source_path = zig_skill_extract_path ++ "/" ++ zig_skill_archive_root ++ "/skills/zig";
-const zig_skill_dest_path = ".agents/skills/zig";
+const skills_archive_url = "https://github.com/ethan-huo/zigdoc/archive/refs/heads/main.zip";
+const skills_archive_root = "zigdoc-main";
+const skills_temp_root = ".zig-cache/zigdoc-skill-install";
+const skills_zip_path = skills_temp_root ++ "/zigdoc.zip";
+const skills_extract_path = skills_temp_root ++ "/extract";
+const skills_source_root = skills_extract_path ++ "/" ++ skills_archive_root ++ "/skills";
+const skills_dest_root = ".agents/skills";
 
 const CliOptions = struct {
     symbols: std.ArrayList([]const u8) = .empty,
@@ -193,8 +193,13 @@ fn parseCli(allocator: std.mem.Allocator, io: std.Io, args: *std.process.Args.It
             std.process.exit(0);
         }
 
-        if (std.mem.eql(u8, arg, "@init")) {
+        if (options.symbols.items.len == 0 and std.mem.eql(u8, arg, "init")) {
             try initProject(allocator, io);
+            std.process.exit(0);
+        }
+
+        if (options.symbols.items.len == 0 and std.mem.eql(u8, arg, "skill")) {
+            try runSkillCommand(allocator, io, args);
             std.process.exit(0);
         }
 
@@ -241,10 +246,31 @@ fn printUsage(io: std.Io) !void {
         \\  --dump-imports    Dump module imports from build.zig as JSON
         \\
         \\Commands:
-        \\  @init             Initialize a new Zig project with AGENTS.md and the Zig skill
+        \\  init              Initialize a new Zig project with AGENTS.md and skills
+        \\  skill install     Install skills into .agents/skills
         \\
     );
     try stdout_writer.interface.flush();
+}
+
+fn runSkillCommand(allocator: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
+    const subcommand = args.next() orelse {
+        std.debug.print("Error: missing skill subcommand\nUsage: zigdoc skill install\n", .{});
+        std.process.exit(1);
+    };
+
+    if (!std.mem.eql(u8, subcommand, "install")) {
+        std.debug.print("Error: unknown skill subcommand: {s}\nUsage: zigdoc skill install\n", .{subcommand});
+        std.process.exit(1);
+    }
+
+    if (args.next()) |extra| {
+        std.debug.print("Error: unexpected argument for 'skill install': {s}\nUsage: zigdoc skill install\n", .{extra});
+        std.process.exit(1);
+    }
+
+    try installSkills(allocator, io, std.Io.Dir.cwd());
+    std.debug.print("Installed skills into .agents/skills\n", .{});
 }
 
 fn initProject(allocator: std.mem.Allocator, io: std.Io) !void {
@@ -277,13 +303,13 @@ fn initProject(allocator: std.mem.Allocator, io: std.Io) !void {
     try cwd.writeFile(io, .{ .sub_path = "src/main.zig", .data = template_main_zig });
     try cwd.writeFile(io, .{ .sub_path = "AGENTS.md", .data = template_agents_md });
     try cwd.writeFile(io, .{ .sub_path = ".gitignore", .data = template_gitignore });
-    try installZigSkill(allocator, io, cwd);
+    try installSkills(allocator, io, cwd);
 
     // Run zig build to get suggested fingerprint from error message
     const result = std.process.run(allocator, io, .{
         .argv = &.{ "zig", "build" },
     }) catch {
-        std.debug.print("Initialized Zig project '{s}' with .agents/skills/zig (run 'zig build' to generate fingerprint)\n", .{name});
+        std.debug.print("Initialized Zig project '{s}' with .agents/skills (run 'zig build' to generate fingerprint)\n", .{name});
         return;
     };
 
@@ -305,15 +331,15 @@ fn initProject(allocator: std.mem.Allocator, io: std.Io) !void {
         try cwd.writeFile(io, .{ .sub_path = "build.zig.zon", .data = new_zon });
     }
 
-    std.debug.print("Initialized Zig project '{s}' with .agents/skills/zig\n", .{name});
+    std.debug.print("Initialized Zig project '{s}' with .agents/skills\n", .{name});
 }
 
-fn installZigSkill(allocator: std.mem.Allocator, io: std.Io, cwd: std.Io.Dir) !void {
-    try deleteTreeIfExists(cwd, io, zig_skill_temp_root);
-    defer cwd.deleteTree(io, zig_skill_temp_root) catch {};
+fn installSkills(allocator: std.mem.Allocator, io: std.Io, cwd: std.Io.Dir) !void {
+    try deleteTreeIfExists(cwd, io, skills_temp_root);
+    defer cwd.deleteTree(io, skills_temp_root) catch {};
 
-    try cwd.createDirPath(io, zig_skill_extract_path);
-    try cwd.createDirPath(io, ".agents/skills");
+    try cwd.createDirPath(io, skills_extract_path);
+    try cwd.createDirPath(io, skills_dest_root);
 
     try runRequiredCommand(allocator, io, &.{
         "curl",
@@ -322,20 +348,43 @@ fn installZigSkill(allocator: std.mem.Allocator, io: std.Io, cwd: std.Io.Dir) !v
         "--silent",
         "--show-error",
         "--output",
-        zig_skill_zip_path,
-        zig_skill_archive_url,
-    }, "download zig skill archive");
+        skills_zip_path,
+        skills_archive_url,
+    }, "download skills archive");
 
     try runRequiredCommand(allocator, io, &.{
         "unzip",
         "-q",
-        zig_skill_zip_path,
+        skills_zip_path,
         "-d",
-        zig_skill_extract_path,
-    }, "extract zig skill archive");
+        skills_extract_path,
+    }, "extract skills archive");
 
-    try deleteTreeIfExists(cwd, io, zig_skill_dest_path);
-    try cwd.rename(zig_skill_source_path, cwd, zig_skill_dest_path, io);
+    try installExtractedSkills(allocator, io, cwd);
+}
+
+fn installExtractedSkills(allocator: std.mem.Allocator, io: std.Io, cwd: std.Io.Dir) !void {
+    var source_dir = try cwd.openDir(io, skills_source_root, .{
+        .access_sub_paths = true,
+        .iterate = true,
+    });
+    defer source_dir.close(io);
+
+    var it = source_dir.iterate();
+    while (try it.next(io)) |entry| {
+        switch (entry.kind) {
+            .directory, .file, .sym_link => {},
+            else => continue,
+        }
+
+        const source_path = try std.fs.path.join(allocator, &.{ skills_source_root, entry.name });
+        defer allocator.free(source_path);
+        const dest_path = try std.fs.path.join(allocator, &.{ skills_dest_root, entry.name });
+        defer allocator.free(dest_path);
+
+        try deleteTreeIfExists(cwd, io, dest_path);
+        try cwd.rename(source_path, cwd, dest_path, io);
+    }
 }
 
 fn deleteTreeIfExists(dir: std.Io.Dir, io: std.Io, sub_path: []const u8) !void {
