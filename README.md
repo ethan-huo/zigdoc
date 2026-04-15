@@ -28,7 +28,6 @@ Examples:
 
 Options:
   -h, --help        Show this help message
-  --toon            Use compact TOON-style output
   --dump-imports    Dump module imports from build.zig as JSON
 
 Commands:

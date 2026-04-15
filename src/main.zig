@@ -13,7 +13,6 @@ const template_agents_md = @embedFile("templates/AGENTS.md.template");
 const template_gitignore = @embedFile("templates/.gitignore.template");
 
 const CliOptions = struct {
-    toon: bool = false,
     symbols: std.ArrayList([]const u8) = .empty,
 };
 
@@ -139,7 +138,6 @@ pub fn main(init: std.process.Init) !void {
     _ = args.skip(); // skip program name
 
     const options = try parseCli(arena.allocator(), io, &args);
-    _ = options.toon;
     if (options.symbols.items.len == 0) {
         try printUsage(io);
         return;
@@ -195,9 +193,9 @@ fn parseCli(allocator: std.mem.Allocator, io: std.Io, args: *std.process.Args.It
             std.process.exit(0);
         }
 
-        if (std.mem.eql(u8, arg, "--toon")) {
-            options.toon = true;
-            continue;
+        if (std.mem.startsWith(u8, arg, "-")) {
+            std.debug.print("Unknown option: {s}\n", .{arg});
+            std.process.exit(1);
         }
 
         try QueryParser.parse(allocator, arg, &options.symbols);
@@ -235,7 +233,6 @@ fn printUsage(io: std.Io) !void {
         \\
         \\Options:
         \\  -h, --help        Show this help message
-        \\  --toon            Use compact TOON-style output
         \\  --dump-imports    Dump module imports from build.zig as JSON
         \\
         \\Commands:
