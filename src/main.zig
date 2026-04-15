@@ -359,8 +359,33 @@ fn runRequiredCommand(
 }
 
 fn substitute(allocator: std.mem.Allocator, template: []const u8, name: []const u8) ![]const u8 {
-    const sanitized = try std.mem.replaceOwned(u8, allocator, name, "-", "_");
+    const sanitized = try sanitizeProjectName(allocator, name);
+    defer allocator.free(sanitized);
     return std.mem.replaceOwned(u8, allocator, template, "{{name}}", sanitized);
+}
+
+fn sanitizeProjectName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    if (name.len == 0 or !isZigIdentifierStart(sanitizedNameByte(name[0]))) {
+        try out.appendSlice(allocator, "project");
+    }
+
+    for (name) |byte| {
+        try out.append(allocator, sanitizedNameByte(byte));
+    }
+
+    return try out.toOwnedSlice(allocator);
+}
+
+fn sanitizedNameByte(byte: u8) u8 {
+    if (std.ascii.isAlphanumeric(byte) or byte == '_') return byte;
+    return '_';
+}
+
+fn isZigIdentifierStart(byte: u8) bool {
+    return std.ascii.isAlphabetic(byte) or byte == '_';
 }
 
 fn dumpImports(arena: *std.heap.ArenaAllocator, io: std.Io) !void {
@@ -1275,6 +1300,18 @@ test "signature cleaner strips docs and preserves Zig punctuation" {
         "(self: Allocator, comptime optional_alignment: ?Alignment, comptime sentinel: Elem) Error![:sentinel]Elem",
         writer.written(),
     );
+}
+
+test "project name sanitizer produces zon-safe identifiers" {
+    const allocator = std.testing.allocator;
+
+    const dotted = try sanitizeProjectName(allocator, "zigdoc-build-template.UARNlX");
+    defer allocator.free(dotted);
+    try std.testing.expectEqualStrings("zigdoc_build_template_UARNlX", dotted);
+
+    const leading_digit = try sanitizeProjectName(allocator, "123-app");
+    defer allocator.free(leading_digit);
+    try std.testing.expectEqualStrings("project123_app", leading_digit);
 }
 
 test "query parser expands nested member groups" {
