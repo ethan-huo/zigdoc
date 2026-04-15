@@ -1,20 +1,23 @@
 const std = @import("std");
 
-pub fn main() !void {
-    const allocator = std.heap.page_allocator;
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    var args = std.process.Args.Iterator.init(init.minimal.args);
+    defer args.deinit();
+    const exe_name = args.next() orelse "gen_readme";
 
-    if (args.len != 3) {
-        std.debug.print("Usage: {s} <help-file> <output-file>\n", .{args[0]});
+    const help_file = args.next() orelse {
+        std.debug.print("Usage: {s} <help-file> <output-file>\n", .{exe_name});
         return error.InvalidArgs;
-    }
+    };
+    const output_file = args.next() orelse {
+        std.debug.print("Usage: {s} <help-file> <output-file>\n", .{exe_name});
+        return error.InvalidArgs;
+    };
 
-    const help_file = args[1];
-    const output_file = args[2];
-
-    const help_content = try std.fs.cwd().readFileAlloc(allocator, help_file, 1024 * 1024);
+    const cwd = std.Io.Dir.cwd();
+    const help_content = try cwd.readFileAlloc(init.io, help_file, allocator, .limited(1024 * 1024));
     defer allocator.free(help_content);
 
     const readme = try std.fmt.allocPrint(allocator,
@@ -66,5 +69,5 @@ pub fn main() !void {
     , .{help_content});
     defer allocator.free(readme);
 
-    try std.fs.cwd().writeFile(.{ .sub_path = output_file, .data = readme });
+    try cwd.writeFile(init.io, .{ .sub_path = output_file, .data = readme });
 }

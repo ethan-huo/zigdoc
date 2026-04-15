@@ -67,7 +67,9 @@ fn resolveHierarchical(allocator: std.mem.Allocator, symbol: []const u8) !?*Decl
 }
 
 test "simple public member resolution" {
-    const allocator = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
     try setupTest(allocator);
     defer {
         for (Walk.files.values()) |*file| file.ast.deinit(allocator);
@@ -86,7 +88,9 @@ test "simple public member resolution" {
 }
 
 test "nested struct member resolution" {
-    const allocator = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
     try setupTest(allocator);
     defer {
         for (Walk.files.values()) |*file| file.ast.deinit(allocator);
@@ -110,7 +114,9 @@ test "nested struct member resolution" {
 }
 
 test "alias chain resolution" {
-    const allocator = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
     try setupTest(allocator);
     defer {
         for (Walk.files.values()) |*file| file.ast.deinit(allocator);
@@ -135,7 +141,9 @@ test "alias chain resolution" {
 }
 
 test "private member not resolved" {
-    const allocator = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
     try setupTest(allocator);
     defer {
         for (Walk.files.values()) |*file| file.ast.deinit(allocator);
@@ -153,7 +161,9 @@ test "private member not resolved" {
 }
 
 test "non-existent symbol" {
-    const allocator = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
     try setupTest(allocator);
     defer {
         for (Walk.files.values()) |*file| file.ast.deinit(allocator);
@@ -171,7 +181,9 @@ test "non-existent symbol" {
 }
 
 test "categorize struct with fields as container" {
-    const allocator = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
     try setupTest(allocator);
     defer {
         for (Walk.files.values()) |*file| file.ast.deinit(allocator);
@@ -196,7 +208,9 @@ test "categorize struct with fields as container" {
 }
 
 test "categorize struct with only consts as namespace" {
-    const allocator = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
     try setupTest(allocator);
     defer {
         for (Walk.files.values()) |*file| file.ast.deinit(allocator);
@@ -221,7 +235,9 @@ test "categorize struct with only consts as namespace" {
 }
 
 test "type function categorization" {
-    const allocator = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
     try setupTest(allocator);
     defer {
         for (Walk.files.values()) |*file| file.ast.deinit(allocator);
@@ -246,7 +262,9 @@ test "type function categorization" {
 }
 
 test "regular function categorization" {
-    const allocator = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
     try setupTest(allocator);
     defer {
         for (Walk.files.values()) |*file| file.ast.deinit(allocator);
@@ -271,7 +289,9 @@ test "regular function categorization" {
 }
 
 test "deep alias chain within limit" {
-    const allocator = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
     try setupTest(allocator);
     defer {
         for (Walk.files.values()) |*file| file.ast.deinit(allocator);

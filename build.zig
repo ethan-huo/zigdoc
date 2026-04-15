@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const ziglint = @import("ziglint");
 
 pub fn build(b: *std.Build) void {
@@ -19,7 +20,7 @@ pub fn build(b: *std.Build) void {
     // Generate README.md as part of the default build
     const readme_run = b.addRunArtifact(exe);
     readme_run.addArg("--help");
-    const help_output = readme_run.captureStdOut();
+    const help_output = readme_run.captureStdOut(.{});
 
     const gen_readme = b.addExecutable(.{
         .name = "gen_readme",
@@ -68,11 +69,13 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(fmt_step);
 
     const lint_step = b.step("lint", "Run ziglint");
-    const ziglint_dep = b.dependency("ziglint", .{ .optimize = .ReleaseFast });
-    lint_step.dependOn(ziglint.addLint(
-        b,
-        ziglint_dep,
-        &.{ b.path("src"), b.path("build.zig"), b.path("build_readme.zig") },
-    ));
-    test_step.dependOn(lint_step);
+    if (comptime builtin.zig_version.order(.{ .major = 0, .minor = 16, .patch = 0 }) == .lt) {
+        const ziglint_dep = b.dependency("ziglint", .{ .optimize = .ReleaseFast });
+        lint_step.dependOn(ziglint.addLint(
+            b,
+            ziglint_dep,
+            &.{ b.path("src"), b.path("build.zig"), b.path("build_readme.zig") },
+        ));
+        test_step.dependOn(lint_step);
+    }
 }

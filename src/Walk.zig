@@ -338,7 +338,7 @@ pub const File = struct {
                 }
 
                 const resolved_path = if (std.fs.path.isAbsolute(file_path))
-                    std.fs.realpathAlloc(gpa, file_path) catch file_path
+                    file_path
                 else blk: {
                     const base_path = file_index.path();
                     break :blk std.fs.path.resolve(gpa, &.{
@@ -360,10 +360,13 @@ pub const File = struct {
                         node,
                     );
                 } else {
-                    const import_content = std.fs.cwd().readFileAlloc(
-                        gpa,
+                    var threaded: std.Io.Threaded = .init_single_threaded;
+                    const io = threaded.io();
+                    const import_content = std.Io.Dir.cwd().readFileAlloc(
+                        io,
                         resolved_path,
-                        10 * 1024 * 1024,
+                        gpa,
+                        .limited(10 * 1024 * 1024),
                     ) catch |err| {
                         log.warn("import target '{s}' could not be read: {}", .{ resolved_path, err });
                         return .{ .global_const = node };
@@ -431,7 +434,9 @@ pub fn addFile(file_name: []const u8, bytes: []u8) !File.Index {
     const ast = try parse(file_name, bytes);
     assert(ast.errors.len == 0);
 
-    const normalized_path = std.fs.realpathAlloc(gpa, file_name) catch file_name;
+    // Keep logical module paths such as "std/mem.zig"; 0.16 moved realpath to
+    // std.Io, and resolving here would also erase the module-relative clue.
+    const normalized_path = file_name;
 
     // Check if this file already exists to avoid duplicate entries
     if (files.getIndex(normalized_path)) |existing_index| {
@@ -843,8 +848,6 @@ fn expr(w: *Walk, scope: *Scope, parent_decl: Decl.Index, node: Ast.Node.Index) 
             }
             try expr(w, scope, parent_decl, full.ast.template);
         },
-
-        .asm_legacy => {},
 
         .builtin_call_two,
         .builtin_call_two_comma,

@@ -22,11 +22,13 @@ Examples:
   zigdoc std.ArrayList
   zigdoc std.mem.Allocator
   zigdoc std.http.Server
+  zigdoc 'std.multi_array_list.MultiArrayList.(insertBounded, appendAssumeCapacity, Slice.(get, set))'
   zigdoc vaxis.Window
   zigdoc zeit.timezone.Posix
 
 Options:
   -h, --help        Show this help message
+  --toon            Use compact TOON-style output
   --dump-imports    Dump module imports from build.zig as JSON
 
 Commands:

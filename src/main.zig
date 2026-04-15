@@ -12,70 +12,211 @@ const template_build_zig_zon = @embedFile("templates/build.zig.zon.template");
 const template_agents_md = @embedFile("templates/AGENTS.md.template");
 const template_gitignore = @embedFile("templates/.gitignore.template");
 
-pub fn main() !void {
-    var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
-    const gpa, const is_debug = gpa: {
-        break :gpa switch (builtin.mode) {
-            .Debug, .ReleaseSafe => .{ debug_allocator.allocator(), true },
-            .ReleaseFast, .ReleaseSmall => .{ std.heap.smp_allocator, false },
-        };
-    };
-    defer if (is_debug) {
-        _ = debug_allocator.deinit();
-    };
+const CliOptions = struct {
+    toon: bool = false,
+    symbols: std.ArrayList([]const u8) = .empty,
+};
 
+const QueryParser = struct {
+    allocator: std.mem.Allocator,
+    input: []const u8,
+    pos: usize = 0,
+
+    fn parse(allocator: std.mem.Allocator, input: []const u8, out: *std.ArrayList([]const u8)) anyerror!void {
+        var parser: QueryParser = .{
+            .allocator = allocator,
+            .input = input,
+        };
+        try parser.parseList("", out, false);
+        parser.skipSpace();
+        if (parser.pos != parser.input.len) return error.InvalidQuery;
+    }
+
+    fn parseList(
+        parser: *QueryParser,
+        prefix: []const u8,
+        out: *std.ArrayList([]const u8),
+        expect_close: bool,
+    ) anyerror!void {
+        var need_item = true;
+        while (parser.pos < parser.input.len) {
+            parser.skipSpace();
+            if (expect_close and parser.peek() == ')') {
+                if (need_item) return error.InvalidQuery;
+                parser.pos += 1;
+                return;
+            }
+
+            try parser.parseItem(prefix, out);
+            need_item = false;
+            parser.skipSpace();
+
+            switch (parser.peek()) {
+                ',' => {
+                    parser.pos += 1;
+                    need_item = true;
+                },
+                ')' => {
+                    if (!expect_close) return error.InvalidQuery;
+                    parser.pos += 1;
+                    return;
+                },
+                0 => {
+                    if (expect_close) return error.InvalidQuery;
+                    return;
+                },
+                else => return error.InvalidQuery,
+            }
+        }
+
+        if (expect_close) return error.InvalidQuery;
+        if (need_item) return error.InvalidQuery;
+    }
+
+    fn parseItem(
+        parser: *QueryParser,
+        prefix: []const u8,
+        out: *std.ArrayList([]const u8),
+    ) anyerror!void {
+        parser.skipSpace();
+        const start = parser.pos;
+        while (parser.pos < parser.input.len) : (parser.pos += 1) {
+            switch (parser.input[parser.pos]) {
+                '(', ')', ',' => break,
+                else => {},
+            }
+        }
+
+        var part = std.mem.trim(u8, parser.input[start..parser.pos], &std.ascii.whitespace);
+        if (part.len == 0) return error.InvalidQuery;
+
+        if (parser.peek() == '(') {
+            if (!std.mem.endsWith(u8, part, ".")) return error.InvalidQuery;
+            part = part[0 .. part.len - 1];
+            const next_prefix = try joinSymbol(parser.allocator, prefix, part);
+            defer parser.allocator.free(next_prefix);
+            parser.pos += 1;
+            try parser.parseList(next_prefix, out, true);
+            return;
+        }
+
+        const symbol = try joinSymbol(parser.allocator, prefix, part);
+        try out.append(parser.allocator, symbol);
+    }
+
+    fn peek(parser: *const QueryParser) u8 {
+        if (parser.pos >= parser.input.len) return 0;
+        return parser.input[parser.pos];
+    }
+
+    fn skipSpace(parser: *QueryParser) void {
+        while (parser.pos < parser.input.len and std.ascii.isWhitespace(parser.input[parser.pos])) {
+            parser.pos += 1;
+        }
+    }
+};
+
+const SymbolDoc = struct {
+    query: []const u8,
+    parent_symbol: []const u8,
+    member_name: []const u8,
+    decl_index: Walk.Decl.Index,
+    target_index: Walk.Decl.Index,
+    category: Walk.Category,
+    file_path: []const u8,
+    line: usize,
+    signature: []const u8,
+};
+
+pub fn main(init: std.process.Init) !void {
+    const gpa = init.gpa;
+    const io = init.io;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
 
-    var args = try std.process.argsWithAllocator(arena.allocator());
+    var args = std.process.Args.Iterator.init(init.minimal.args);
     defer args.deinit();
     _ = args.skip(); // skip program name
 
-    const symbol = args.next();
-
-    if (symbol == null) {
-        try printUsage();
-        return;
-    }
-
-    if (std.mem.eql(u8, symbol.?, "--help") or std.mem.eql(u8, symbol.?, "-h")) {
-        try printUsage();
-        return;
-    }
-
-    if (std.mem.eql(u8, symbol.?, "--dump-imports")) {
-        try dumpImports(&arena);
-        return;
-    }
-
-    if (std.mem.eql(u8, symbol.?, "@init")) {
-        try initProject(arena.allocator());
+    const options = try parseCli(arena.allocator(), io, &args);
+    _ = options.toon;
+    if (options.symbols.items.len == 0) {
+        try printUsage(io);
         return;
     }
 
     Walk.init(arena.allocator());
     Walk.Decl.init(arena.allocator());
 
-    const std_dir_path = try getStdDir(&arena);
+    const std_dir_path = try getStdDir(&arena, io);
 
-    // Only parse std library if the symbol starts with "std"
-    if (std.mem.startsWith(u8, symbol.?, "std")) {
-        try walkStdLib(&arena, std_dir_path);
+    var needs_std = false;
+    var needs_build = false;
+    for (options.symbols.items) |symbol| {
+        if (isStdSymbol(symbol)) {
+            needs_std = true;
+        } else {
+            needs_build = true;
+        }
+    }
+
+    if (needs_std) {
+        try walkStdLib(&arena, io, std_dir_path);
 
         // Register std/std.zig as the "std" module for @import("std")
         const std_file_index = Walk.files.getIndex("std/std.zig") orelse return error.StdNotFound;
         try Walk.modules.put(arena.allocator(), "std", @enumFromInt(std_file_index));
-    } else {
-        // For non-std symbols, process build.zig to get imported modules
-        try processBuildZig(&arena);
     }
 
-    try printDocs(arena.allocator(), symbol.?, std_dir_path);
+    if (needs_build) {
+        try processBuildZig(&arena, io);
+    }
+
+    try printDocs(arena.allocator(), options.symbols.items, std_dir_path);
 }
 
-fn printUsage() !void {
+fn parseCli(allocator: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !CliOptions {
+    var options: CliOptions = .{};
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            try printUsage(io);
+            std.process.exit(0);
+        }
+
+        if (std.mem.eql(u8, arg, "--dump-imports")) {
+            var arena = std.heap.ArenaAllocator.init(allocator);
+            defer arena.deinit();
+            try dumpImports(&arena, io);
+            std.process.exit(0);
+        }
+
+        if (std.mem.eql(u8, arg, "@init")) {
+            try initProject(allocator, io);
+            std.process.exit(0);
+        }
+
+        if (std.mem.eql(u8, arg, "--toon")) {
+            options.toon = true;
+            continue;
+        }
+
+        try QueryParser.parse(allocator, arg, &options.symbols);
+    }
+    return options;
+}
+
+fn joinSymbol(allocator: std.mem.Allocator, prefix: []const u8, part: []const u8) ![]const u8 {
+    if (prefix.len == 0) return allocator.dupe(u8, part);
+    return std.fmt.allocPrint(allocator, "{s}.{s}", .{ prefix, part });
+}
+
+fn isStdSymbol(symbol: []const u8) bool {
+    return std.mem.eql(u8, symbol, "std") or std.mem.startsWith(u8, symbol, "std.");
+}
+
+fn printUsage(io: std.Io) !void {
     var stdout_buf: [1024]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
+    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buf);
     try stdout_writer.interface.writeAll(
         \\Usage: zigdoc [options] <symbol>
         \\
@@ -88,11 +229,13 @@ fn printUsage() !void {
         \\  zigdoc std.ArrayList
         \\  zigdoc std.mem.Allocator
         \\  zigdoc std.http.Server
+        \\  zigdoc 'std.multi_array_list.MultiArrayList.(insertBounded, appendAssumeCapacity, Slice.(get, set))'
         \\  zigdoc vaxis.Window
         \\  zigdoc zeit.timezone.Posix
         \\
         \\Options:
         \\  -h, --help        Show this help message
+        \\  --toon            Use compact TOON-style output
         \\  --dump-imports    Dump module imports from build.zig as JSON
         \\
         \\Commands:
@@ -102,39 +245,39 @@ fn printUsage() !void {
     try stdout_writer.interface.flush();
 }
 
-fn initProject(allocator: std.mem.Allocator) !void {
-    const cwd = std.fs.cwd();
+fn initProject(allocator: std.mem.Allocator, io: std.Io) !void {
+    const cwd = std.Io.Dir.cwd();
 
     // Check if project already exists
-    if (cwd.access("build.zig", .{})) |_| {
+    if (cwd.access(io, "build.zig", .{})) |_| {
         std.debug.print("Error: build.zig already exists\n", .{});
         return error.ProjectExists;
     } else |_| {}
 
     // Get project name from current directory
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const cwd_path = try cwd.realpath(".", &path_buf);
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const cwd_path_len = try cwd.realPath(io, &path_buf);
+    const cwd_path = path_buf[0..cwd_path_len];
     const name = std.fs.path.basename(cwd_path);
 
     // Create src directory
-    try cwd.makeDir("src");
+    try cwd.createDir(io, "src", .default_dir);
 
     // Write files with substitutions
-    try cwd.writeFile(.{
+    try cwd.writeFile(io, .{
         .sub_path = "build.zig",
         .data = try substitute(allocator, template_build_zig, name),
     });
-    try cwd.writeFile(.{
+    try cwd.writeFile(io, .{
         .sub_path = "build.zig.zon",
         .data = try substitute(allocator, template_build_zig_zon, name),
     });
-    try cwd.writeFile(.{ .sub_path = "src/main.zig", .data = template_main_zig });
-    try cwd.writeFile(.{ .sub_path = "AGENTS.md", .data = template_agents_md });
-    try cwd.writeFile(.{ .sub_path = ".gitignore", .data = template_gitignore });
+    try cwd.writeFile(io, .{ .sub_path = "src/main.zig", .data = template_main_zig });
+    try cwd.writeFile(io, .{ .sub_path = "AGENTS.md", .data = template_agents_md });
+    try cwd.writeFile(io, .{ .sub_path = ".gitignore", .data = template_gitignore });
 
     // Run zig build to get suggested fingerprint from error message
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
+    const result = std.process.run(allocator, io, .{
         .argv = &.{ "zig", "build" },
     }) catch {
         std.debug.print("Initialized Zig project '{s}' (run 'zig build' to generate fingerprint)\n", .{name});
@@ -148,7 +291,7 @@ fn initProject(allocator: std.mem.Allocator) !void {
         const fingerprint = result.stderr[fp_start..fp_end];
 
         // Read current build.zig.zon and insert fingerprint
-        const zon_content = try cwd.readFileAlloc(allocator, "build.zig.zon", 64 * 1024);
+        const zon_content = try cwd.readFileAlloc(io, "build.zig.zon", allocator, .limited(64 * 1024));
         const new_zon = try std.mem.replaceOwned(
             u8,
             allocator,
@@ -156,7 +299,7 @@ fn initProject(allocator: std.mem.Allocator) !void {
             ".version = \"0.0.0\",",
             try std.fmt.allocPrint(allocator, ".version = \"0.0.0\",\n    .fingerprint = {s},", .{fingerprint}),
         );
-        try cwd.writeFile(.{ .sub_path = "build.zig.zon", .data = new_zon });
+        try cwd.writeFile(io, .{ .sub_path = "build.zig.zon", .data = new_zon });
     }
 
     std.debug.print("Initialized Zig project '{s}'\n", .{name});
@@ -167,19 +310,18 @@ fn substitute(allocator: std.mem.Allocator, template: []const u8, name: []const 
     return std.mem.replaceOwned(u8, allocator, template, "{{name}}", sanitized);
 }
 
-fn dumpImports(arena: *std.heap.ArenaAllocator) !void {
+fn dumpImports(arena: *std.heap.ArenaAllocator, io: std.Io) !void {
     // Check if build.zig exists
-    std.fs.cwd().access("build.zig", .{}) catch {
+    std.Io.Dir.cwd().access(io, "build.zig", .{}) catch {
         std.debug.print("No build.zig found in current directory\n", .{});
         return error.NoBuildZig;
     };
 
     // Setup the build runner
-    try setupBuildRunner(arena);
+    try setupBuildRunner(arena, io);
 
     // Run zig build with our custom runner
-    const result = try std.process.Child.run(.{
-        .allocator = arena.allocator(),
+    const result = try std.process.run(arena.allocator(), io, .{
         .argv = &[_][]const u8{
             "zig",
             "build",
@@ -188,14 +330,14 @@ fn dumpImports(arena: *std.heap.ArenaAllocator) !void {
         },
     });
 
-    if (result.term.Exited != 0) {
+    if (result.term != .exited or result.term.exited != 0) {
         std.debug.print("Error running build runner:\n{s}\n", .{result.stderr});
         return error.BuildRunnerFailed;
     }
 
     // Print the JSON output directly
     var stdout_buf: [4096]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
+    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buf);
     try stdout_writer.interface.writeAll(result.stdout);
     try stdout_writer.interface.flush();
 }
@@ -204,13 +346,12 @@ const ZigEnv = struct {
     std_dir: []const u8,
 };
 
-fn getZigVersion(arena: *std.heap.ArenaAllocator) !std.SemanticVersion {
-    const version_result = try std.process.Child.run(.{
-        .allocator = arena.allocator(),
+fn getZigVersion(arena: *std.heap.ArenaAllocator, io: std.Io) !std.SemanticVersion {
+    const version_result = try std.process.run(arena.allocator(), io, .{
         .argv = &[_][]const u8{ "zig", "version" },
     });
 
-    if (version_result.term.Exited != 0) {
+    if (version_result.term != .exited or version_result.term.exited != 0) {
         return error.ZigVersionFailed;
     }
 
@@ -218,8 +359,8 @@ fn getZigVersion(arena: *std.heap.ArenaAllocator) !std.SemanticVersion {
     return std.SemanticVersion.parse(version_str);
 }
 
-fn setupBuildRunner(arena: *std.heap.ArenaAllocator) !void {
-    const version = try getZigVersion(arena);
+fn setupBuildRunner(arena: *std.heap.ArenaAllocator, io: std.Io) !void {
+    const version = try getZigVersion(arena, io);
 
     const runner_src = switch (version.minor) {
         14 => build_runner_0_14,
@@ -227,31 +368,30 @@ fn setupBuildRunner(arena: *std.heap.ArenaAllocator) !void {
         else => return error.UnsupportedZigVersion,
     };
 
-    std.fs.cwd().makeDir(".zig-cache") catch |err| switch (err) {
+    std.Io.Dir.cwd().createDir(io, ".zig-cache", .default_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
 
     const runner_path = ".zig-cache/zigdoc_build_runner.zig";
-    try std.fs.cwd().writeFile(.{
+    try std.Io.Dir.cwd().writeFile(io, .{
         .sub_path = runner_path,
         .data = runner_src,
     });
 }
 
-fn processBuildZig(arena: *std.heap.ArenaAllocator) !void {
+fn processBuildZig(arena: *std.heap.ArenaAllocator, io: std.Io) !void {
     // Check if build.zig exists
-    std.fs.cwd().access("build.zig", .{}) catch {
+    std.Io.Dir.cwd().access(io, "build.zig", .{}) catch {
         // No build.zig, nothing to do
         return;
     };
 
     // Setup the build runner
-    try setupBuildRunner(arena);
+    try setupBuildRunner(arena, io);
 
     // Run zig build with our custom runner
-    const result = try std.process.Child.run(.{
-        .allocator = arena.allocator(),
+    const result = try std.process.run(arena.allocator(), io, .{
         .argv = &[_][]const u8{
             "zig",
             "build",
@@ -260,16 +400,16 @@ fn processBuildZig(arena: *std.heap.ArenaAllocator) !void {
         },
     });
 
-    if (result.term.Exited != 0) {
+    if (result.term != .exited or result.term.exited != 0) {
         log.err("Failed to analyze build.zig", .{});
         return;
     }
 
     // Parse the output to extract module information
-    try parseBuildOutput(arena.allocator(), result.stdout);
+    try parseBuildOutput(arena.allocator(), io, result.stdout);
 }
 
-fn parseBuildOutput(allocator: std.mem.Allocator, output: []const u8) !void {
+fn parseBuildOutput(allocator: std.mem.Allocator, io: std.Io, output: []const u8) !void {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, output, .{});
     defer parsed.deinit();
 
@@ -287,10 +427,11 @@ fn parseBuildOutput(allocator: std.mem.Allocator, output: []const u8) !void {
         if (!std.mem.endsWith(u8, root_path, ".zig")) continue;
 
         // Read and add the module file
-        const file_content = std.fs.cwd().readFileAlloc(
-            allocator,
+        const file_content = std.Io.Dir.cwd().readFileAlloc(
+            io,
             root_path,
-            10 * 1024 * 1024,
+            allocator,
+            .limited(10 * 1024 * 1024),
         ) catch |err| {
             std.debug.print("Failed to read module {s}: {}\n", .{ module_name, err });
             continue;
@@ -310,10 +451,11 @@ fn parseBuildOutput(allocator: std.mem.Allocator, output: []const u8) !void {
                 if (!std.mem.endsWith(u8, import_path, ".zig")) continue;
 
                 // Read and add the imported file
-                const import_content = std.fs.cwd().readFileAlloc(
-                    allocator,
+                const import_content = std.Io.Dir.cwd().readFileAlloc(
+                    io,
                     import_path,
-                    10 * 1024 * 1024,
+                    allocator,
+                    .limited(10 * 1024 * 1024),
                 ) catch |err| {
                     std.debug.print("Failed to read import {s}: {}\n", .{ import_name, err });
                     continue;
@@ -326,17 +468,16 @@ fn parseBuildOutput(allocator: std.mem.Allocator, output: []const u8) !void {
     }
 }
 
-fn getStdDir(arena: *std.heap.ArenaAllocator) ![]const u8 {
-    const version = try getZigVersion(arena);
+fn getStdDir(arena: *std.heap.ArenaAllocator, io: std.Io) ![]const u8 {
+    const version = try getZigVersion(arena, io);
 
     const is_pre_0_15 = version.order(.{ .major = 0, .minor = 15, .patch = 0 }) == .lt;
 
-    const result = try std.process.Child.run(.{
-        .allocator = arena.allocator(),
+    const result = try std.process.run(arena.allocator(), io, .{
         .argv = &[_][]const u8{ "zig", "env" },
     });
 
-    if (result.term.Exited != 0) {
+    if (result.term != .exited or result.term.exited != 0) {
         return error.ZigEnvFailed;
     }
 
@@ -351,7 +492,7 @@ fn getStdDir(arena: *std.heap.ArenaAllocator) ![]const u8 {
         );
         return parsed.value.std_dir;
     } else {
-        const parsed = try std.zon.parse.fromSlice(
+        const parsed = try std.zon.parse.fromSliceAlloc(
             ZigEnv,
             arena.allocator(),
             stdout,
@@ -362,26 +503,24 @@ fn getStdDir(arena: *std.heap.ArenaAllocator) ![]const u8 {
     }
 }
 
-fn walkStdLib(arena: *std.heap.ArenaAllocator, std_dir_path: []const u8) !void {
+fn walkStdLib(arena: *std.heap.ArenaAllocator, io: std.Io, std_dir_path: []const u8) !void {
     const allocator = arena.allocator();
-    var dir = try std.fs.openDirAbsolute(std_dir_path, .{ .iterate = true });
-    defer dir.close();
+    var dir = try std.Io.Dir.openDirAbsolute(io, std_dir_path, .{ .iterate = true });
+    defer dir.close(io);
 
     var walker = try dir.walk(allocator);
     defer walker.deinit();
 
-    while (try walker.next()) |entry| {
+    while (try walker.next(io)) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.basename, ".zig")) continue;
         if (std.mem.endsWith(u8, entry.basename, "test.zig")) continue;
 
-        const file_content = try entry.dir.readFileAllocOptions(
-            allocator,
+        const file_content = try entry.dir.readFileAlloc(
+            io,
             entry.basename,
-            10 * 1024 * 1024,
-            null,
-            @enumFromInt(0),
-            0,
+            allocator,
+            .limited(10 * 1024 * 1024),
         );
 
         const file_name = try std.fmt.allocPrint(allocator, "std/{s}", .{entry.path});
@@ -390,13 +529,13 @@ fn walkStdLib(arena: *std.heap.ArenaAllocator, std_dir_path: []const u8) !void {
     }
 }
 
-fn resolveHierarchical(allocator: std.mem.Allocator, symbol: []const u8) !?*Walk.Decl {
+fn resolveHierarchical(allocator: std.mem.Allocator, symbol: []const u8) !?Walk.Decl.Index {
     var parts = std.mem.splitScalar(u8, symbol, '.');
     const first_part = parts.next() orelse return null;
 
     // Find the root declaration
-    var current_decl: ?*Walk.Decl = null;
-    for (Walk.decls.items) |*decl| {
+    var current_decl: ?Walk.Decl.Index = null;
+    for (Walk.decls.items, 0..) |*decl, i| {
         const info = decl.extraInfo();
         if (!info.is_pub) continue;
 
@@ -405,7 +544,7 @@ fn resolveHierarchical(allocator: std.mem.Allocator, symbol: []const u8) !?*Walk
         try decl.fqn(&fqn_buf);
 
         if (std.mem.eql(u8, fqn_buf.items, first_part)) {
-            current_decl = decl;
+            current_decl = @enumFromInt(i);
             break;
         }
     }
@@ -416,7 +555,7 @@ fn resolveHierarchical(allocator: std.mem.Allocator, symbol: []const u8) !?*Walk
     while (parts.next()) |part| {
         // Follow aliases with circular reference protection
         var search_decl = current_decl.?;
-        var category = search_decl.categorize();
+        var category = search_decl.get().categorize();
         var hop_count: usize = 0;
         while (category == .alias) {
             hop_count += 1;
@@ -424,18 +563,18 @@ fn resolveHierarchical(allocator: std.mem.Allocator, symbol: []const u8) !?*Walk
                 log.err("Circular alias detected resolving '{s}'", .{symbol});
                 return error.CircularAlias;
             }
-            search_decl = category.alias.get();
-            category = search_decl.categorize();
+            search_decl = category.alias;
+            category = search_decl.get().categorize();
         }
 
         // Find child with matching name
         var found = false;
-        for (Walk.decls.items) |*candidate| {
-            if (candidate.parent != .none and candidate.parent.get() == search_decl) {
+        for (Walk.decls.items, 0..) |*candidate, i| {
+            if (candidate.parent != .none and @intFromEnum(candidate.parent) == @intFromEnum(search_decl)) {
                 const member_info = candidate.extraInfo();
                 if (!member_info.is_pub) continue;
                 if (std.mem.eql(u8, member_info.name, part)) {
-                    current_decl = candidate;
+                    current_decl = @enumFromInt(i);
                     found = true;
                     break;
                 }
@@ -448,114 +587,40 @@ fn resolveHierarchical(allocator: std.mem.Allocator, symbol: []const u8) !?*Walk
     return current_decl;
 }
 
-fn printDeclInfo(
-    allocator: std.mem.Allocator,
-    stdout: anytype,
-    decl: *Walk.Decl,
-    symbol: []const u8,
-    std_dir_path: []const u8,
-) !void {
-    const file_path = decl.file.path();
-    const ast = decl.file.getAst();
-    const info = decl.extraInfo();
-
-    // Print header
-    try stdout.print("Symbol: {s}\n", .{symbol});
-    const full_path = try getFullPath(allocator, std_dir_path, file_path);
-    defer allocator.free(full_path);
-
-    // Get line number
-    const token_starts = ast.tokens.items(.start);
-    const main_token = ast.nodeMainToken(decl.ast_node);
-    const byte_offset = token_starts[main_token];
-    const loc = std.zig.findLineColumn(ast.source, byte_offset);
-
-    try stdout.print("Location: {s}:{d}\n", .{ full_path, loc.line + 1 });
-
-    // Follow aliases to the actual implementation
-    var target_decl = decl;
-    var category = decl.categorize();
-    while (category == .alias) {
-        const aliasee_index = category.alias;
-        target_decl = aliasee_index.get();
-        category = target_decl.categorize();
-
-        var aliasee_fqn: std.ArrayList(u8) = .empty;
-        defer aliasee_fqn.deinit(allocator);
-        try target_decl.fqn(&aliasee_fqn);
-
-        const aliasee_path = target_decl.file.path();
-        const aliasee_full_path = try getFullPath(allocator, std_dir_path, aliasee_path);
-        defer allocator.free(aliasee_full_path);
-
-        // Get line number for alias target
-        const target_ast = target_decl.file.getAst();
-        const target_token_starts = target_ast.tokens.items(.start);
-        const target_main_token = target_ast.nodeMainToken(target_decl.ast_node);
-        const target_byte_offset = target_token_starts[target_main_token];
-        const target_loc = std.zig.findLineColumn(target_ast.source, target_byte_offset);
-
-        try stdout.print("Alias Target: {s}\n", .{aliasee_fqn.items});
-        try stdout.print("Target Location: {s}:{d}\n", .{ aliasee_full_path, target_loc.line + 1 });
-    }
-
-    // Print category and signature
-    try stdout.print("Category: {s}\n", .{@tagName(category)});
-    const target_ast = target_decl.file.getAst();
-    const target_node = target_decl.ast_node;
-    try printSignature(stdout, target_ast, target_decl, category);
-
-    // Print documentation
-    // For file roots, always try to show container doc comments from the target
-    const target_info = target_decl.extraInfo();
-    const has_docs = if (target_ast.nodeTag(target_node) == .root)
-        target_info.first_doc_comment.unwrap() != null
-    else
-        info.first_doc_comment.unwrap() != null or target_info.first_doc_comment.unwrap() != null;
-
-    if (has_docs) {
-        try stdout.writeAll("\nDocumentation:\n");
-        if (target_ast.nodeTag(target_node) == .root) {
-            if (target_info.first_doc_comment.unwrap()) |target_first_doc| {
-                try printContainerDocComments(stdout, target_ast, target_first_doc);
-            }
-        } else {
-            // For non-root nodes, prefer original docs, fallback to target
-            if (info.first_doc_comment.unwrap()) |first_doc_comment| {
-                try printDocComments(stdout, ast, first_doc_comment);
-            } else if (target_info.first_doc_comment.unwrap()) |target_first_doc| {
-                try printDocComments(stdout, target_ast, target_first_doc);
-            }
-        }
-    }
-
-    // Print members for namespaces, containers, and type functions
-    const has_members = try printMembers(allocator, stdout, target_decl, category);
-
-    // For type functions without members, show source code instead
-    if (category == .type_function and !has_members) {
-        try stdout.writeAll("\nSource:\n");
-        try printSource(stdout, target_ast, target_node);
-    }
-}
-
-fn printDocs(allocator: std.mem.Allocator, symbol: []const u8, std_dir_path: []const u8) !void {
+fn printDocs(allocator: std.mem.Allocator, symbols: []const []const u8, std_dir_path: []const u8) !void {
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const io = threaded.io();
     var stdout_buf: [4096]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
+    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buf);
     const stdout = &stdout_writer.interface;
 
-    // Try hierarchical resolution first (e.g., "zeit.timezone.Posix")
-    if (std.mem.indexOf(u8, symbol, ".")) |_| {
-        if (try resolveHierarchical(allocator, symbol)) |decl| {
-            try printDeclInfo(allocator, stdout, decl, symbol, std_dir_path);
+    var docs: std.ArrayList(SymbolDoc) = .empty;
+    defer docs.deinit(allocator);
+
+    for (symbols) |symbol| {
+        const decl_index = try findSymbol(allocator, symbol) orelse {
+            try printNotFound(allocator, stdout, symbol);
             try stdout.flush();
-            return;
-        }
+            std.process.exit(1);
+        };
+        try docs.append(allocator, try buildSymbolDoc(allocator, symbol, decl_index));
     }
 
-    // Search for matching declarations by FQN
-    var found = false;
-    for (Walk.decls.items) |*decl| {
+    if (docs.items.len == 1) {
+        try renderSingleDoc(allocator, stdout, docs.items[0], std_dir_path);
+    } else {
+        try renderGroupedDocs(allocator, stdout, docs.items, std_dir_path);
+    }
+
+    try stdout.flush();
+}
+
+fn findSymbol(allocator: std.mem.Allocator, symbol: []const u8) !?Walk.Decl.Index {
+    if (std.mem.indexOf(u8, symbol, ".")) |_| {
+        if (try resolveHierarchical(allocator, symbol)) |decl_index| return decl_index;
+    }
+
+    for (Walk.decls.items, 0..) |*decl, i| {
         const file_path = decl.file.path();
         if (file_path.len == 0) continue;
 
@@ -569,58 +634,193 @@ fn printDocs(allocator: std.mem.Allocator, symbol: []const u8, std_dir_path: []c
         defer fqn_buf.deinit(allocator);
         try decl.fqn(&fqn_buf);
 
-        if (std.mem.eql(u8, fqn_buf.items, symbol)) {
-            found = true;
-            try printDeclInfo(allocator, stdout, decl, symbol, std_dir_path);
-            break;
+        if (std.mem.eql(u8, fqn_buf.items, symbol)) return @enumFromInt(i);
+    }
+
+    return null;
+}
+
+fn buildSymbolDoc(allocator: std.mem.Allocator, symbol: []const u8, decl_index: Walk.Decl.Index) !SymbolDoc {
+    const target_index, const category = try resolveAliasTarget(decl_index);
+    const target_decl = target_index.get();
+    return .{
+        .query = symbol,
+        .parent_symbol = try parentSymbol(allocator, symbol),
+        .member_name = memberName(symbol),
+        .decl_index = decl_index,
+        .target_index = target_index,
+        .category = category,
+        .file_path = target_decl.file.path(),
+        .line = declLine(target_decl),
+        .signature = try formatSignature(allocator, target_decl.file.getAst(), target_decl, category),
+    };
+}
+
+fn resolveAliasTarget(decl_index: Walk.Decl.Index) !struct { Walk.Decl.Index, Walk.Category } {
+    var target_index = decl_index;
+    var category = target_index.get().categorize();
+    var hop_count: usize = 0;
+    while (category == .alias) {
+        hop_count += 1;
+        if (hop_count >= 64) return error.CircularAlias;
+        target_index = category.alias;
+        category = target_index.get().categorize();
+    }
+    return .{ target_index, category };
+}
+
+fn parentSymbol(allocator: std.mem.Allocator, symbol: []const u8) ![]const u8 {
+    const dot = std.mem.lastIndexOfScalar(u8, symbol, '.') orelse return allocator.dupe(u8, symbol);
+    return allocator.dupe(u8, symbol[0..dot]);
+}
+
+fn memberName(symbol: []const u8) []const u8 {
+    const dot = std.mem.lastIndexOfScalar(u8, symbol, '.') orelse return symbol;
+    return symbol[dot + 1 ..];
+}
+
+fn declLine(decl: *const Walk.Decl) usize {
+    const ast = decl.file.getAst();
+    const token_starts = ast.tokens.items(.start);
+    const main_token = ast.nodeMainToken(decl.ast_node);
+    const byte_offset = token_starts[main_token];
+    const loc = std.zig.findLineColumn(ast.source, byte_offset);
+    return loc.line + 1;
+}
+
+fn renderSingleDoc(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    doc: SymbolDoc,
+    std_dir_path: []const u8,
+) !void {
+    _ = std_dir_path;
+    try writer.print("{s}\n", .{doc.query});
+    if (doc.signature.len > 0) try writer.print("  signature: {s}\n", .{doc.signature});
+    try writer.print("  at {s}:{d}\n", .{ doc.file_path, doc.line });
+    try writer.print("  category: {s}\n", .{@tagName(doc.category)});
+
+    if (doc.target_index != doc.decl_index) {
+        var target_fqn: std.ArrayList(u8) = .empty;
+        defer target_fqn.deinit(allocator);
+        try doc.target_index.get().fqn(&target_fqn);
+        try writer.print("  alias target: {s}\n", .{target_fqn.items});
+    }
+
+    try renderDocComments(writer, doc);
+    const has_members = try printMembers(allocator, writer, doc.target_index.get(), doc.category);
+    if (doc.category == .type_function and !has_members) {
+        try writer.writeAll("\nSource:\n");
+        try printSource(writer, doc.target_index.get().file.getAst(), doc.target_index.get().ast_node);
+    }
+
+    try writer.writeAll("\nhint: use cx with the shown file and line to inspect source\n");
+}
+
+fn renderGroupedDocs(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    docs: []const SymbolDoc,
+    std_dir_path: []const u8,
+) !void {
+    _ = std_dir_path;
+
+    var first_group = true;
+    for (docs) |doc| {
+        if (hasEarlierParent(docs, doc.parent_symbol, doc.query)) continue;
+        if (!first_group) try writer.writeAll("\n");
+        first_group = false;
+
+        try renderGroupHeader(allocator, writer, doc.parent_symbol);
+        const count = countParent(docs, doc.parent_symbol);
+        try writer.print("[{d}]{{member,signature,line}}:\n", .{count});
+        for (docs) |member_doc| {
+            if (!std.mem.eql(u8, member_doc.parent_symbol, doc.parent_symbol)) continue;
+            try writer.print("  .{s}  {s}  {d}\n", .{
+                member_doc.member_name,
+                member_doc.signature,
+                member_doc.line,
+            });
+        }
+
+        var wrote_docs = false;
+        for (docs) |member_doc| {
+            if (!std.mem.eql(u8, member_doc.parent_symbol, doc.parent_symbol)) continue;
+            if (!hasDocComment(member_doc)) continue;
+            if (!wrote_docs) {
+                try writer.writeAll("\ndocs:\n");
+                wrote_docs = true;
+            }
+            try writer.print("  .{s}:\n", .{member_doc.member_name});
+            try renderIndentedDocComments(writer, member_doc, 4);
         }
     }
 
-    if (!found) {
-        try stdout.writeAll("Symbol not found: ");
-        try stdout.print("'{s}'\n\n", .{symbol});
+    try writer.writeAll("\nhint: use cx with the shown file and line to inspect source\n");
+}
 
-        // Provide helpful suggestions
-        var parts = std.mem.splitScalar(u8, symbol, '.');
-        const first_part = parts.next() orelse {
-            try stdout.writeAll("Tip: Specify a symbol like 'std.ArrayList' or 'moduleName.Symbol'\n");
-            try stdout.flush();
-            std.process.exit(1);
-        };
-
-        // Check if the module exists
-        const module_exists = blk: {
-            for (Walk.decls.items) |*decl| {
-                var fqn_buf: std.ArrayList(u8) = .empty;
-                defer fqn_buf.deinit(allocator);
-                try decl.fqn(&fqn_buf);
-                if (std.mem.eql(u8, fqn_buf.items, first_part)) break :blk true;
-            }
-            break :blk false;
-        };
-
-        if (!module_exists) {
-            try stdout.print("Module '{s}' not found.\n", .{first_part});
-            if (Walk.modules.count() > 0) {
-                try stdout.writeAll("\nAvailable modules:\n");
-                var iter = Walk.modules.iterator();
-                while (iter.next()) |entry| {
-                    try stdout.print("  {s}\n", .{entry.key_ptr.*});
-                }
-            }
-        } else {
-            try stdout.print("Module '{s}' found, but could not find symbol '{s}'.\n", .{ first_part, symbol });
-            try stdout.writeAll("Possible reasons:\n");
-            try stdout.writeAll("  - The symbol is private (not marked with 'pub')\n");
-            try stdout.writeAll("  - The symbol name is misspelled\n");
-            try stdout.writeAll("  - The symbol is nested deeper than specified\n");
-        }
-
-        try stdout.flush();
-        std.process.exit(1);
+fn renderGroupHeader(allocator: std.mem.Allocator, writer: anytype, parent_symbol: []const u8) !void {
+    if (try findSymbol(allocator, parent_symbol)) |parent_index| {
+        const target_index, _ = try resolveAliasTarget(parent_index);
+        const target = target_index.get();
+        try writer.print("{s} at {s}:{d}\n", .{ parent_symbol, target.file.path(), declLine(target) });
+    } else {
+        try writer.print("{s}\n", .{parent_symbol});
     }
+}
 
-    try stdout.flush();
+fn hasEarlierParent(docs: []const SymbolDoc, parent: []const u8, query: []const u8) bool {
+    for (docs) |doc| {
+        if (std.mem.eql(u8, doc.query, query)) return false;
+        if (std.mem.eql(u8, doc.parent_symbol, parent)) return true;
+    }
+    return false;
+}
+
+fn countParent(docs: []const SymbolDoc, parent: []const u8) usize {
+    var count: usize = 0;
+    for (docs) |doc| {
+        if (std.mem.eql(u8, doc.parent_symbol, parent)) count += 1;
+    }
+    return count;
+}
+
+fn printNotFound(allocator: std.mem.Allocator, writer: anytype, symbol: []const u8) !void {
+    try writer.writeAll("Symbol not found: ");
+    try writer.print("'{s}'\n\n", .{symbol});
+
+    var parts = std.mem.splitScalar(u8, symbol, '.');
+    const first_part = parts.next() orelse {
+        try writer.writeAll("Tip: Specify a symbol like 'std.ArrayList' or 'moduleName.Symbol'\n");
+        return;
+    };
+
+    const module_exists = blk: {
+        for (Walk.decls.items) |*decl| {
+            var fqn_buf: std.ArrayList(u8) = .empty;
+            defer fqn_buf.deinit(allocator);
+            try decl.fqn(&fqn_buf);
+            if (std.mem.eql(u8, fqn_buf.items, first_part)) break :blk true;
+        }
+        break :blk false;
+    };
+
+    if (!module_exists) {
+        try writer.print("Module '{s}' not found.\n", .{first_part});
+        if (Walk.modules.count() > 0) {
+            try writer.writeAll("\nAvailable modules:\n");
+            var iter = Walk.modules.iterator();
+            while (iter.next()) |entry| {
+                try writer.print("  {s}\n", .{entry.key_ptr.*});
+            }
+        }
+    } else {
+        try writer.print("Module '{s}' found, but could not find symbol '{s}'.\n", .{ first_part, symbol });
+        try writer.writeAll("Possible reasons:\n");
+        try writer.writeAll("  - The symbol is private (not marked with 'pub')\n");
+        try writer.writeAll("  - The symbol name is misspelled\n");
+        try writer.writeAll("  - The symbol is nested deeper than specified\n");
+    }
 }
 
 fn printMembers(allocator: std.mem.Allocator, writer: anytype, decl: *const Walk.Decl, category: Walk.Category) !bool {
@@ -843,138 +1043,184 @@ fn getFullPath(allocator: std.mem.Allocator, std_dir_path: []const u8, file_path
     return std.fmt.allocPrint(allocator, "{s}/{s}", .{ std_dir_path, file_path });
 }
 
-fn printSignature(writer: anytype, ast: *const std.zig.Ast, _: *const Walk.Decl, category: Walk.Category) !void {
+fn formatSignature(
+    allocator: std.mem.Allocator,
+    ast: *const std.zig.Ast,
+    decl: *const Walk.Decl,
+    category: Walk.Category,
+) ![]const u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    try writeSignatureValue(allocator, &writer.writer, ast, decl, category);
+    return try writer.toOwnedSlice();
+}
+
+fn printSignature(writer: anytype, ast: *const std.zig.Ast, decl: *const Walk.Decl, category: Walk.Category) !void {
+    var allocating: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
+    defer allocating.deinit();
+    try writeSignatureValue(std.heap.page_allocator, &allocating.writer, ast, decl, category);
+    const signature = allocating.written();
+    switch (category) {
+        .function, .type_function => try writer.print("Signature: {s}\n", .{signature}),
+        .global_const, .global_variable => try writer.print("Declaration: {s}\n", .{signature}),
+        .container, .namespace => try writer.print("Type: {s}\n", .{signature}),
+        else => {},
+    }
+}
+
+fn writeSignatureValue(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    ast: *const std.zig.Ast,
+    _: *const Walk.Decl,
+    category: Walk.Category,
+) !void {
     switch (category) {
         .function, .type_function => |node| {
             var buf: [1]std.zig.Ast.Node.Index = undefined;
             const fn_proto = ast.fullFnProto(&buf, node) orelse return;
 
             const start_token = fn_proto.firstToken();
-            // For function declarations, stop at the body (don't include '{' and beyond)
-            // Find the end of the function prototype
-            var end_token = start_token;
-            var paren_depth: i32 = 0;
-            var found_return_type = false;
-            var token_idx = start_token;
-
-            while (token_idx < ast.tokens.len) : (token_idx += 1) {
-                const tag = ast.tokenTag(token_idx);
-
-                if (tag == .l_paren) paren_depth += 1;
-                if (tag == .r_paren) paren_depth -= 1;
-
-                // Once we've closed all parens, we're past the parameter list
-                if (paren_depth == 0 and found_return_type) {
-                    end_token = token_idx;
-                    break;
-                }
-
-                // Track when we've seen the return type (after closing parens)
-                if (paren_depth == 0 and tag == .r_paren) {
-                    found_return_type = true;
-                }
-
-                end_token = token_idx;
-
-                // Stop before function body
-                if (tag == .l_brace) {
-                    end_token = token_idx - 1;
-                    break;
-                }
-            }
-
-            try writer.writeAll("Signature: ");
-            token_idx = start_token;
-            var prev_tag: std.zig.Token.Tag = .invalid;
-            while (token_idx <= end_token) : (token_idx += 1) {
-                const tag = ast.tokenTag(token_idx);
-                if (tag == .doc_comment) continue;
-
-                const token_slice = ast.tokenSlice(token_idx);
-
-                // Skip trailing comma before closing paren
-                if (tag == .comma) {
-                    const next_token = token_idx + 1;
-                    if (next_token <= end_token and ast.tokenTag(next_token) == .r_paren) {
-                        continue;
-                    }
-                }
-
-                // Add spacing rules for better readability
-                if (token_idx > start_token) {
-                    const needs_space = switch (prev_tag) {
-                        .comma => true,
-                        .colon => true, // Space after colon
-                        .keyword_pub, .keyword_fn, .keyword_const, .keyword_var, .keyword_comptime => true,
-                        .asterisk, .l_bracket, .question_mark, .period => false, // No space after *, [, ?, .
-                        .r_bracket => tag != .identifier and
-                            tag != .keyword_const and
-                            tag != .keyword_var, // Space after ] except before type name
-                        else => switch (tag) {
-                            .l_paren, .r_paren, .r_bracket, .comma, .semicolon => false,
-                            .colon, .period => false, // No space before : or .
-                            .l_bracket, .asterisk => false, // No space before [ or *
-                            else => prev_tag != .l_paren,
-                        },
-                    };
-                    if (needs_space) try writer.writeAll(" ");
-                }
-
-                try writer.writeAll(token_slice);
-                prev_tag = tag;
-            }
-            try writer.writeAll("\n");
+            const end_token = if (fn_proto.ast.return_type.unwrap()) |return_type|
+                ast.lastToken(return_type)
+            else
+                findClosingParen(ast, fn_proto.lparen);
+            const source = sourceForTokenRange(ast, start_token, end_token);
+            try writeCollapsedWhitespace(allocator, writer, source);
         },
         .global_const, .global_variable => |node| {
             const var_decl = ast.fullVarDecl(node) orelse return;
             const start_token = var_decl.firstToken();
             const end_token = ast.lastToken(node);
-
-            try writer.writeAll("Declaration: ");
-            var token_idx = start_token;
-            var prev_tag: std.zig.Token.Tag = .invalid;
-            while (token_idx <= end_token) : (token_idx += 1) {
-                const tag = ast.tokenTag(token_idx);
-                if (tag == .doc_comment) continue;
-
-                const token_slice = ast.tokenSlice(token_idx);
-
-                // Add spacing rules
-                if (token_idx > start_token) {
-                    const needs_space = switch (prev_tag) {
-                        .colon, .equal => true,
-                        .keyword_pub, .keyword_const, .keyword_var, .keyword_comptime => true,
-                        else => switch (tag) {
-                            .colon, .equal, .semicolon => false,
-                            else => true,
-                        },
-                    };
-                    if (needs_space) try writer.writeAll(" ");
-                }
-
-                try writer.writeAll(token_slice);
-                prev_tag = tag;
-            }
-            try writer.writeAll("\n");
+            const source = sourceForTokenRange(ast, start_token, end_token);
+            try writeCollapsedWhitespace(allocator, writer, source);
         },
         .container => |node| {
             if (ast.nodeTag(node) == .root) {
-                try writer.writeAll("Type: struct (file root)\n");
+                try writer.writeAll("struct (file root)");
             } else {
                 const main_token = ast.nodeMainToken(node);
                 const container_kind = ast.tokenSlice(main_token);
-                try writer.print("Type: {s}\n", .{container_kind});
+                try writer.print("{s}", .{container_kind});
             }
         },
         .namespace => |node| {
             if (ast.nodeTag(node) == .root) {
-                try writer.writeAll("Type: namespace (file root)\n");
+                try writer.writeAll("namespace (file root)");
             } else {
-                try writer.writeAll("Type: namespace (struct)\n");
+                try writer.writeAll("namespace (struct)");
             }
         },
         else => {},
     }
+}
+
+fn findClosingParen(ast: *const std.zig.Ast, lparen: std.zig.Ast.TokenIndex) std.zig.Ast.TokenIndex {
+    var depth: usize = 0;
+    var token_idx = lparen;
+    while (token_idx < ast.tokens.len) : (token_idx += 1) {
+        switch (ast.tokenTag(token_idx)) {
+            .l_paren => depth += 1,
+            .r_paren => {
+                depth -= 1;
+                if (depth == 0) return token_idx;
+            },
+            else => {},
+        }
+    }
+    return lparen;
+}
+
+fn sourceForTokenRange(
+    ast: *const std.zig.Ast,
+    start_token: std.zig.Ast.TokenIndex,
+    end_token: std.zig.Ast.TokenIndex,
+) []const u8 {
+    const token_starts = ast.tokens.items(.start);
+    const start_offset = token_starts[start_token];
+    const end_offset = if (end_token + 1 < ast.tokens.len)
+        token_starts[end_token + 1]
+    else
+        ast.source.len;
+    return std.mem.trim(u8, ast.source[start_offset..end_offset], &std.ascii.whitespace);
+}
+
+fn writeCollapsedWhitespace(allocator: std.mem.Allocator, writer: anytype, source: []const u8) !void {
+    _ = allocator;
+    var previous_space = false;
+    for (source) |byte| {
+        if (std.ascii.isWhitespace(byte)) {
+            if (!previous_space) try writer.writeByte(' ');
+            previous_space = true;
+        } else {
+            try writer.writeByte(byte);
+            previous_space = false;
+        }
+    }
+}
+
+fn hasDocComment(doc: SymbolDoc) bool {
+    const decl = doc.decl_index.get();
+    const target_decl = doc.target_index.get();
+    const target_ast = target_decl.file.getAst();
+    const target_info = target_decl.extraInfo();
+    if (target_ast.nodeTag(target_decl.ast_node) == .root) {
+        return hasDocToken(target_ast, target_info.first_doc_comment.unwrap(), .container_doc_comment);
+    }
+    return hasDocToken(decl.file.getAst(), decl.extraInfo().first_doc_comment.unwrap(), .doc_comment) or
+        hasDocToken(target_ast, target_info.first_doc_comment.unwrap(), .doc_comment);
+}
+
+fn hasDocToken(ast: *const std.zig.Ast, maybe_token: ?std.zig.Ast.TokenIndex, tag: std.zig.Token.Tag) bool {
+    const token = maybe_token orelse return false;
+    return ast.tokenTag(token) == tag;
+}
+
+fn renderDocComments(writer: anytype, doc: SymbolDoc) !void {
+    if (!hasDocComment(doc)) return;
+    try writer.writeAll("\ndoc:\n");
+    try renderIndentedDocComments(writer, doc, 2);
+}
+
+fn renderIndentedDocComments(writer: anytype, doc: SymbolDoc, indent: usize) !void {
+    const decl = doc.decl_index.get();
+    const target_decl = doc.target_index.get();
+    const ast = decl.file.getAst();
+    const target_ast = target_decl.file.getAst();
+    const target_info = target_decl.extraInfo();
+
+    if (target_ast.nodeTag(target_decl.ast_node) == .root) {
+        if (target_info.first_doc_comment.unwrap()) |target_first_doc| {
+            try writeDocLines(writer, target_ast, target_first_doc, .container_doc_comment, indent);
+        }
+        return;
+    }
+
+    if (decl.extraInfo().first_doc_comment.unwrap()) |first_doc_comment| {
+        try writeDocLines(writer, ast, first_doc_comment, .doc_comment, indent);
+    } else if (target_info.first_doc_comment.unwrap()) |target_first_doc| {
+        try writeDocLines(writer, target_ast, target_first_doc, .doc_comment, indent);
+    }
+}
+
+fn writeDocLines(
+    writer: anytype,
+    ast: *const std.zig.Ast,
+    first_token: std.zig.Ast.TokenIndex,
+    tag: std.zig.Token.Tag,
+    indent: usize,
+) !void {
+    var token_index = first_token;
+    while (ast.tokenTag(token_index) == tag) : (token_index += 1) {
+        const comment = ast.tokenSlice(token_index);
+        try writeIndent(writer, indent);
+        try writer.print("{s}\n", .{std.mem.trimStart(u8, comment[3..], " ")});
+    }
+}
+
+fn writeIndent(writer: anytype, indent: usize) !void {
+    var i: usize = 0;
+    while (i < indent) : (i += 1) try writer.writeByte(' ');
 }
 
 fn printDocComments(writer: anytype, ast: *const std.zig.Ast, first_token: std.zig.Ast.TokenIndex) !void {
@@ -1011,4 +1257,42 @@ fn printSource(writer: anytype, ast: *const std.zig.Ast, node: std.zig.Ast.Node.
     while (lines.next()) |line| {
         try writer.print("  {s}\n", .{line});
     }
+}
+
+test "query parser expands nested member groups" {
+    const allocator = std.testing.allocator;
+    var symbols: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (symbols.items) |symbol| allocator.free(symbol);
+        symbols.deinit(allocator);
+    }
+
+    try QueryParser.parse(
+        allocator,
+        "std.multi_array_list.MultiArrayList.(insertBounded, appendAssumeCapacity, Slice.(get, set))",
+        &symbols,
+    );
+
+    try std.testing.expectEqual(@as(usize, 4), symbols.items.len);
+    try std.testing.expectEqualStrings("std.multi_array_list.MultiArrayList.insertBounded", symbols.items[0]);
+    try std.testing.expectEqualStrings("std.multi_array_list.MultiArrayList.appendAssumeCapacity", symbols.items[1]);
+    try std.testing.expectEqualStrings("std.multi_array_list.MultiArrayList.Slice.get", symbols.items[2]);
+    try std.testing.expectEqualStrings("std.multi_array_list.MultiArrayList.Slice.set", symbols.items[3]);
+}
+
+test "query parser rejects unbalanced groups" {
+    var symbols: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (symbols.items) |symbol| std.testing.allocator.free(symbol);
+        symbols.deinit(std.testing.allocator);
+    }
+
+    try std.testing.expectError(
+        error.InvalidQuery,
+        QueryParser.parse(std.testing.allocator, "std.ArrayList.(init", &symbols),
+    );
+}
+
+test {
+    _ = @import("test_symbol_resolution.zig");
 }

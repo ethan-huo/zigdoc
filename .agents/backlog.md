@@ -1,0 +1,2 @@
+- 2026-04-15: `ziglint 0.5.2` does not build on Zig 0.16.0 (`Io.Dir.realpathZ`, `process.SpawnOptions.StdIo.Ignore`). `build.zig` skips wiring the lint step on 0.16+ so default build/test can run; revisit when ziglint publishes a compatible release or replace the lint integration.
+- 2026-04-15: custom `--build-runner` support still only has 0.14/0.15 runners. `--dump-imports` and non-std dependency symbol discovery return `UnsupportedZigVersion` on Zig 0.16.0 until a 0.16 build runner is ported.
