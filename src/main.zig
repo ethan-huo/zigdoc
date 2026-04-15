@@ -259,7 +259,7 @@ fn initProject(allocator: std.mem.Allocator, io: std.Io) !void {
 
     // Get project name from current directory
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const cwd_path_len = try cwd.realPath(io, &path_buf);
+    const cwd_path_len = try std.process.currentPath(io, &path_buf);
     const cwd_path = path_buf[0..cwd_path_len];
     const name = std.fs.path.basename(cwd_path);
 
