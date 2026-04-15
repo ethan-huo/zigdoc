@@ -3,8 +3,7 @@ const builtin = @import("builtin");
 const Walk = @import("Walk.zig");
 const log = std.log.scoped(.zigdoc);
 
-const build_runner_0_14 = @embedFile("build_runner_0.14.zig");
-const build_runner_0_15 = @embedFile("build_runner_0.15.zig");
+const build_runner = @embedFile("build_runner.zig");
 
 const template_build_zig = @embedFile("templates/build.zig.template");
 const template_main_zig = @embedFile("templates/main.zig.template");
@@ -439,12 +438,13 @@ fn getZigVersion(arena: *std.heap.ArenaAllocator, io: std.Io) !std.SemanticVersi
 
 fn setupBuildRunner(arena: *std.heap.ArenaAllocator, io: std.Io) !void {
     const version = try getZigVersion(arena, io);
-
-    const runner_src = switch (version.minor) {
-        14 => build_runner_0_14,
-        15 => build_runner_0_15,
-        else => return error.UnsupportedZigVersion,
-    };
+    if (version.major != 0 or version.minor != 16) {
+        std.debug.print(
+            "zigdoc supports Zig 0.16.x build.zig analysis; found {d}.{d}.{d}\n",
+            .{ version.major, version.minor, version.patch },
+        );
+        return error.UnsupportedZigVersion;
+    }
 
     std.Io.Dir.cwd().createDir(io, ".zig-cache", .default_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
@@ -454,7 +454,7 @@ fn setupBuildRunner(arena: *std.heap.ArenaAllocator, io: std.Io) !void {
     const runner_path = ".zig-cache/zigdoc_build_runner.zig";
     try std.Io.Dir.cwd().writeFile(io, .{
         .sub_path = runner_path,
-        .data = runner_src,
+        .data = build_runner,
     });
 }
 

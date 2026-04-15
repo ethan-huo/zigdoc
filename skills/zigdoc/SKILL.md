@@ -130,12 +130,13 @@ map to:
 
 where `<std_dir>` comes from `zig env`.
 
-For dependency/module paths, use the path shown by `zigdoc`. If dependency discovery fails with `UnsupportedZigVersion`, fall back to local project source inspection and note that the build-runner support may be behind the installed Zig version.
+For dependency/module paths, use the path shown by `zigdoc`. Build.zig analysis
+tracks the current supported Zig line, currently Zig 0.16.x.
 
 ## Failure Handling
 
 - `Symbol not found`: query the parent type/module first, then retry with the discovered member name.
-- `UnsupportedZigVersion`: std queries may still work; build.zig dependency discovery likely needs a newer zigdoc build runner.
+- `UnsupportedZigVersion`: std queries may still work; install the Zig version supported by the current zigdoc release for build.zig dependency discovery.
 - Empty docs for a function are acceptable. Rely on `sig` and source inspection.
 - Long or ambiguous source lookup: use `zigdoc` for the exact line, then `cx o <file>` or `cx d --name <member> --from <file>` to narrow.
 
