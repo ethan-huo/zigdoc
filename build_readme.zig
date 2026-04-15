@@ -38,8 +38,12 @@ pub fn main(init: std.process.Init) !void {
         \\
         \\## Project Initialization
         \\
-        \\`zigdoc @init` scaffolds a minimal Zig project with `AGENTS.md`
-        \\plus `build.zig` and `build.zig.zon` configured for `ziglint`.
+        \\`zigdoc @init` scaffolds a minimal Zig project with `AGENTS.md`,
+        \\installs the Zig skill to `.agents/skills/zig`, and creates `build.zig`
+        \\plus `build.zig.zon` configured for `ziglint`.
+        \\
+        \\Skill installation downloads the latest zigdoc repository archive, so
+        \\`curl`, `unzip`, and network access are required.
         \\
         \\```bash
         \\mkdir my-project && cd my-project

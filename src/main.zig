@@ -12,6 +12,14 @@ const template_build_zig_zon = @embedFile("templates/build.zig.zon.template");
 const template_agents_md = @embedFile("templates/AGENTS.md.template");
 const template_gitignore = @embedFile("templates/.gitignore.template");
 
+const zig_skill_archive_url = "https://github.com/ethan-huo/zigdoc/archive/refs/heads/main.zip";
+const zig_skill_archive_root = "zigdoc-main";
+const zig_skill_temp_root = ".zig-cache/zigdoc-init";
+const zig_skill_zip_path = zig_skill_temp_root ++ "/zigdoc.zip";
+const zig_skill_extract_path = zig_skill_temp_root ++ "/extract";
+const zig_skill_source_path = zig_skill_extract_path ++ "/" ++ zig_skill_archive_root ++ "/skills/zig";
+const zig_skill_dest_path = ".agents/skills/zig";
+
 const CliOptions = struct {
     symbols: std.ArrayList([]const u8) = .empty,
 };
@@ -234,7 +242,7 @@ fn printUsage(io: std.Io) !void {
         \\  --dump-imports    Dump module imports from build.zig as JSON
         \\
         \\Commands:
-        \\  @init             Initialize a new Zig project with AGENTS.md
+        \\  @init             Initialize a new Zig project with AGENTS.md and the Zig skill
         \\
     );
     try stdout_writer.interface.flush();
@@ -270,12 +278,13 @@ fn initProject(allocator: std.mem.Allocator, io: std.Io) !void {
     try cwd.writeFile(io, .{ .sub_path = "src/main.zig", .data = template_main_zig });
     try cwd.writeFile(io, .{ .sub_path = "AGENTS.md", .data = template_agents_md });
     try cwd.writeFile(io, .{ .sub_path = ".gitignore", .data = template_gitignore });
+    try installZigSkill(allocator, io, cwd);
 
     // Run zig build to get suggested fingerprint from error message
     const result = std.process.run(allocator, io, .{
         .argv = &.{ "zig", "build" },
     }) catch {
-        std.debug.print("Initialized Zig project '{s}' (run 'zig build' to generate fingerprint)\n", .{name});
+        std.debug.print("Initialized Zig project '{s}' with .agents/skills/zig (run 'zig build' to generate fingerprint)\n", .{name});
         return;
     };
 
@@ -297,7 +306,56 @@ fn initProject(allocator: std.mem.Allocator, io: std.Io) !void {
         try cwd.writeFile(io, .{ .sub_path = "build.zig.zon", .data = new_zon });
     }
 
-    std.debug.print("Initialized Zig project '{s}'\n", .{name});
+    std.debug.print("Initialized Zig project '{s}' with .agents/skills/zig\n", .{name});
+}
+
+fn installZigSkill(allocator: std.mem.Allocator, io: std.Io, cwd: std.Io.Dir) !void {
+    try deleteTreeIfExists(cwd, io, zig_skill_temp_root);
+    defer cwd.deleteTree(io, zig_skill_temp_root) catch {};
+
+    try cwd.createDirPath(io, zig_skill_extract_path);
+    try cwd.createDirPath(io, ".agents/skills");
+
+    try runRequiredCommand(allocator, io, &.{
+        "curl",
+        "--fail",
+        "--location",
+        "--silent",
+        "--show-error",
+        "--output",
+        zig_skill_zip_path,
+        zig_skill_archive_url,
+    }, "download zig skill archive");
+
+    try runRequiredCommand(allocator, io, &.{
+        "unzip",
+        "-q",
+        zig_skill_zip_path,
+        "-d",
+        zig_skill_extract_path,
+    }, "extract zig skill archive");
+
+    try deleteTreeIfExists(cwd, io, zig_skill_dest_path);
+    try cwd.rename(zig_skill_source_path, cwd, zig_skill_dest_path, io);
+}
+
+fn deleteTreeIfExists(dir: std.Io.Dir, io: std.Io, sub_path: []const u8) !void {
+    try dir.deleteTree(io, sub_path);
+}
+
+fn runRequiredCommand(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    argv: []const []const u8,
+    step: []const u8,
+) !void {
+    const result = try std.process.run(allocator, io, .{ .argv = argv });
+    if (result.term == .exited and result.term.exited == 0) return;
+
+    std.debug.print("Error: failed to {s}\n", .{step});
+    if (result.stderr.len > 0) std.debug.print("{s}\n", .{result.stderr});
+    if (result.stdout.len > 0) std.debug.print("{s}\n", .{result.stdout});
+    return error.CommandFailed;
 }
 
 fn substitute(allocator: std.mem.Allocator, template: []const u8, name: []const u8) ![]const u8 {
